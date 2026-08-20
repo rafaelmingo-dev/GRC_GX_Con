@@ -489,8 +489,4 @@ with tab4:
 
     if btc and btc.get("anual"):
         st.markdown("#### Bitcoin — somente GARCH Anual")
-        st.write(
-            f"Preço: {fmt_num(btc['preco'])} • "
-            f"Banda: {btc['anual']['rotulo']} • "
-            f"Distância: {fmt_pct(btc['anual']['dist_pct'])} • "
-            f"{btc['anual']['status']}"
+        st.write(f"Preço: {fmt_num(btc['preco'])} • Banda: {btc['anual']['rotulo']} • Distância: {fmt_pct(btc['anual']['dist_pct'])} • {btc['anual']['status']}")
