@@ -22,9 +22,6 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-import matplotlib.pyplot as plt
-import matplotlib.ticker as mticker
-import mplfinance as mpf
 import numpy as np
 import pandas as pd
 import requests
@@ -6085,6 +6082,10 @@ def plot_price_with_gex_levels(
             }
         )
     )
+
+    # Import tardio: o painel de confluência não usa este gráfico no startup.
+    # Mantém a função disponível sem carregar Matplotlib/mplfinance durante o pico de memória B3.
+    import mplfinance as mpf
 
     fig, axes = mpf.plot(
         price_frame,
