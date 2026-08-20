@@ -1,0 +1,29 @@
+{
+  "status": "OK",
+  "painel": "GARCH × GEX — Confluência V3 Streamlit",
+  "garch_core_preservado_byte_a_byte": true,
+  "gex_core_preservado_byte_a_byte": true,
+  "regras": {
+    "mensal_x_30d": true,
+    "semestral_x_90d": true,
+    "semestral_x_180d": true,
+    "anual_sozinho": true,
+    "gex_60d_fora": true,
+    "principal_w1": true,
+    "secundaria_w2_w3": true,
+    "sem_score": true,
+    "sem_limiar_qualitativo": true
+  },
+  "sha256_garch_core": "54cc5bab7fc3f08f3182d04eb92b72dbf6fd023e47419e1dd0f5d94bd2e8aa2f",
+  "sha256_gex_core": "df112c69646c855e99d7d268383ffb23d26a3dd3194d2ad25634b3d7d4da275a",
+  "arquivos": [
+    ".gitignore",
+    ".streamlit/config.toml",
+    "README.md",
+    "app.py",
+    "confluence_core.py",
+    "garch_core.py",
+    "gex_core.py",
+    "requirements.txt"
+  ]
+}
