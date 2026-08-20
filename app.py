@@ -1,18 +1,17 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+import gc
 import io
 import zipfile
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
-import plotly.graph_objects as go
 import streamlit as st
 
-import garch_core as garch
+# O GEX é carregado primeiro. GARCH/ARCH e Plotly entram somente depois do pico de memória do pipeline B3.
 import gex_core as gex
-import confluence_core as core
 
 st.set_page_config(
     page_title="GARCH × GEX — Confluência V3",
@@ -41,8 +40,33 @@ if "ativo_detalhe" not in st.session_state:
 
 
 @st.cache_resource(show_spinner=False)
-def carregar_gex_bundle(refresh_token: int):
-    return gex.load_complete_bundle(force=refresh_token > 0)
+def preparar_runtime_gex(refresh_token: int):
+    """Carrega o GEX uma única vez sem manter uma segunda cópia grande no cache.
+
+    O load_complete_bundle devolve DataFrames grandes e initialize_runtime instala
+    cópias no módulo GEX. Se o bundle inteiro também ficar no cache, o Cloud pode
+    manter as duas cópias simultaneamente. Aqui o cache guarda somente metadata.
+    """
+    # Em atualização forçada, libera o runtime anterior antes do novo pipeline.
+    if refresh_token > 0:
+        try:
+            gex.gex_series = pd.DataFrame()
+            gex.historical_prices = pd.DataFrame()
+            gex.metadata = {}
+        except Exception:
+            pass
+        gc.collect()
+
+    series, metadata, history = gex.load_complete_bundle(force=refresh_token > 0)
+    gex.initialize_runtime(series, metadata, history)
+
+    # O runtime já possui os dados necessários; as variáveis locais não precisam
+    # permanecer retidas pelo cache.
+    del series
+    del history
+    gc.collect()
+
+    return dict(metadata)
 
 
 @st.cache_data(show_spinner=False, ttl=1800)
@@ -284,12 +308,19 @@ token = int(st.session_state.refresh_token)
 
 try:
     with st.spinner("Buscando a última sessão completa da B3 e preparando o motor GEX..."):
-        series, metadata, history = carregar_gex_bundle(token)
-        gex.initialize_runtime(series, metadata, history)
+        metadata = preparar_runtime_gex(token)
         gex_reference_date = pd.Timestamp(metadata["reference_date"])
 except Exception as exc:
     st.error(f"Falha ao carregar o GEX: {type(exc).__name__}: {exc}")
     st.stop()
+
+# Imports pesados somente DEPOIS do pipeline GEX/B3.
+# Isso reduz o pico de memória no Streamlit Community Cloud sem alterar a matemática.
+import garch_core as garch
+import confluence_core as core
+import plotly.graph_objects as go
+
+gc.collect()
 
 ativos_comuns = [
     codigo for codigo in garch.ATIVOS.keys()
@@ -312,6 +343,7 @@ for i, ativo in enumerate(ativos_comuns, start=1):
         except Exception as exc:
             st.warning(f"{ativo}: falha no cruzamento — {type(exc).__name__}: {exc}")
     progress.progress(i / len(ativos_comuns), text=f"{ativo} — {i}/{len(ativos_comuns)}")
+    gc.collect()
 progress.empty()
 
 # BTC: somente contexto anual do GARCH
@@ -462,4 +494,3 @@ with tab4:
             f"Banda: {btc['anual']['rotulo']} • "
             f"Distância: {fmt_pct(btc['anual']['dist_pct'])} • "
             f"{btc['anual']['status']}"
-        )
