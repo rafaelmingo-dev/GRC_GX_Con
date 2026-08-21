@@ -273,7 +273,7 @@ if payload is None:
         """
 <div class="v3-status">
 <b>Primeira execução:</b> clique em <b>Preparar painel agora</b>.
-O cálculo pesado será feito em um processo separado. O resultado final só substitui
+O cálculo pesado será feito em um processo separado, com leitura B3 filtrada para os ativos monitorados. O resultado final só substitui
 o cache depois que todas as etapas terminarem.
 </div>
 """,
