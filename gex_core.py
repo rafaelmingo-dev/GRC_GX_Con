@@ -1,3 +1,5 @@
+ChatGPT
+Bibliotecagex_core.py
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
@@ -9,6 +11,7 @@ from __future__ import annotations
 # ============================================================
 
 import base64
+import gc
 import io
 import json
 import math
@@ -1072,13 +1075,17 @@ def child_text(
 
 
 def parse_instruments(path):
-    """Lê BVBG.028.02 e mapeia opções ao ativo-objeto."""
-    ns = "{urn:bvmf.100.02.xsd}"
-    option_records = []
-    instrument_records = []
+    """Lê BVBG.028.02 e mapeia opções ao ativo-objeto com uso de memória reduzido.
 
+    A matemática não muda. A otimização é apenas de ingestão:
+    1) primeira passagem cria um mapa compacto instrument_id -> ticker;
+    2) segunda passagem guarda somente opções cujo ativo-objeto pertence a ATIVOS_PILOTO.
+    """
+    ns = "{urn:bvmf.100.02.xsd}"
     started = time.time()
-    count = 0
+
+    ticker_by_id = {}
+    instrument_count = 0
 
     context = etree.iterparse(
         str(path),
@@ -1089,188 +1096,199 @@ def parse_instruments(path):
     )
 
     for _, element in context:
-        count += 1
+        instrument_count += 1
 
         instrument_id = child_text(
             element,
             f"./{ns}FinInstrmId/{ns}OthrId/{ns}Id",
         )
 
-        asset = child_text(
-            element,
-            f"./{ns}FinInstrmAttrCmon/{ns}Asst",
-        )
-
-        asset_description = child_text(
-            element,
-            f"./{ns}FinInstrmAttrCmon/{ns}AsstDesc",
-        )
-
-        ticker_node = element.find(
-            f".//{ns}TckrSymb"
-        )
-        isin_node = element.find(
-            f".//{ns}ISIN"
-        )
-
+        ticker_node = element.find(f".//{ns}TckrSymb")
         ticker = (
             ticker_node.text.strip()
-            if ticker_node is not None
-            and ticker_node.text
-            else None
-        )
-
-        isin = (
-            isin_node.text.strip()
-            if isin_node is not None
-            and isin_node.text
+            if ticker_node is not None and ticker_node.text
             else None
         )
 
         if instrument_id and ticker:
-            instrument_records.append(
-                {
-                    "instrument_id": instrument_id,
-                    "ticker": ticker,
-                    "asset": asset,
-                    "asset_description": asset_description,
-                    "isin": isin,
-                }
-            )
-
-        option = element.find(
-            f".//{ns}OptnOnEqtsInf"
-        )
-        record_type = "OptnOnEqtsInf"
-
-        if option is None:
-            option = element.find(
-                f".//{ns}OptnOnSpotAndFutrsInf"
-            )
-            record_type = "OptnOnSpotAndFutrsInf"
-
-        if option is not None and ticker:
-            def opt_text(name):
-                node = option.find(
-                    f".//{ns}{name}"
-                )
-                return (
-                    node.text.strip()
-                    if node is not None
-                    and node.text
-                    else None
-                )
-
-            underlying_id = child_text(
-                option,
-                f"./{ns}UndrlygInstrmId/{ns}OthrId/{ns}Id",
-            )
-
-            option_records.append(
-                {
-                    "instrument_id": instrument_id,
-                    "symbol": ticker,
-                    "isin": isin,
-                    "asset": asset,
-                    "asset_description": asset_description,
-                    "option_type": opt_text("OptnTp"),
-                    "option_style": (
-                        opt_text("OptnStyle")
-                        or opt_text("ExrcStyle")
-                    ),
-                    "strike": opt_text("ExrcPric"),
-                    "maturity_date": opt_text("XprtnDt"),
-                    "trading_start_date": opt_text("TradgStartDt"),
-                    "trading_end_date": opt_text("TradgEndDt"),
-                    # AllcnRndLot é lote de alocação; não é
-                    # multiplicador econômico do GEX.
-                    "contract_size": opt_text("AllcnRndLot"),
-                    "price_factor": opt_text("PricFctr"),
-                    "underlying_id": underlying_id,
-                    "record_type": record_type,
-                }
-            )
+            ticker_by_id[instrument_id] = ticker
 
         element.clear()
         while element.getprevious() is not None:
             del element.getparent()[0]
 
-        if count % 50000 == 0:
-            print(
-                f"    Cadastro: {count:,} instrumentos..."
-            )
+        if instrument_count % 50000 == 0:
+            print(f"    Cadastro mapa: {instrument_count:,} instrumentos...")
 
     del context
 
-    instruments = (
-        pd.DataFrame(instrument_records)
-        .drop_duplicates(
-            "instrument_id",
-            keep="last",
+    option_records = []
+
+    context = etree.iterparse(
+        str(path),
+        events=("end",),
+        tag=ns + "Instrm",
+        huge_tree=True,
+        recover=True,
+    )
+
+    for _, element in context:
+        ticker_node = element.find(f".//{ns}TckrSymb")
+        isin_node = element.find(f".//{ns}ISIN")
+
+        ticker = (
+            ticker_node.text.strip()
+            if ticker_node is not None and ticker_node.text
+            else None
         )
-    )
 
-    options = (
-        pd.DataFrame(option_records)
-        .drop_duplicates(
-            "instrument_id",
-            keep="last",
+        isin = (
+            isin_node.text.strip()
+            if isin_node is not None and isin_node.text
+            else None
         )
-    )
 
-    ticker_map = instruments.set_index(
-        "instrument_id"
-    )["ticker"]
+        if ticker:
+            option = element.find(f".//{ns}OptnOnEqtsInf")
+            record_type = "OptnOnEqtsInf"
 
-    options["underlying_ticker"] = (
-        options["underlying_id"]
-        .map(ticker_map)
-    )
+            if option is None:
+                option = element.find(f".//{ns}OptnOnSpotAndFutrsInf")
+                record_type = "OptnOnSpotAndFutrsInf"
 
-    for column in (
+            if option is not None:
+                underlying_id = child_text(
+                    option,
+                    f"./{ns}UndrlygInstrmId/{ns}OthrId/{ns}Id",
+                )
+
+                underlying_ticker = ticker_by_id.get(underlying_id)
+
+                if underlying_ticker in ATIVOS_PILOTO:
+                    instrument_id = child_text(
+                        element,
+                        f"./{ns}FinInstrmId/{ns}OthrId/{ns}Id",
+                    )
+
+                    asset = child_text(
+                        element,
+                        f"./{ns}FinInstrmAttrCmon/{ns}Asst",
+                    )
+
+                    asset_description = child_text(
+                        element,
+                        f"./{ns}FinInstrmAttrCmon/{ns}AsstDesc",
+                    )
+
+                    def opt_text(name):
+                        node = option.find(f".//{ns}{name}")
+                        return (
+                            node.text.strip()
+                            if node is not None and node.text
+                            else None
+                        )
+
+                    option_records.append(
+                        {
+                            "instrument_id": instrument_id,
+                            "symbol": ticker,
+                            "isin": isin,
+                            "asset": asset,
+                            "asset_description": asset_description,
+                            "option_type": opt_text("OptnTp"),
+                            "option_style": (
+                                opt_text("OptnStyle")
+                                or opt_text("ExrcStyle")
+                            ),
+                            "strike": opt_text("ExrcPric"),
+                            "maturity_date": opt_text("XprtnDt"),
+                            "trading_start_date": opt_text("TradgStartDt"),
+                            "trading_end_date": opt_text("TradgEndDt"),
+                            "contract_size": opt_text("AllcnRndLot"),
+                            "price_factor": opt_text("PricFctr"),
+                            "underlying_id": underlying_id,
+                            "underlying_ticker": underlying_ticker,
+                            "record_type": record_type,
+                        }
+                    )
+
+        element.clear()
+        while element.getprevious() is not None:
+            del element.getparent()[0]
+
+    del context
+
+    option_columns = [
+        "instrument_id",
+        "symbol",
+        "isin",
+        "asset",
+        "asset_description",
+        "option_type",
+        "option_style",
         "strike",
-        "contract_size",
-        "price_factor",
-    ):
-        options[column] = pd.to_numeric(
-            options[column],
-            errors="coerce",
-        )
-
-    for column in (
         "maturity_date",
         "trading_start_date",
         "trading_end_date",
-    ):
-        options[column] = pd.to_datetime(
-            options[column],
-            errors="coerce",
+        "contract_size",
+        "price_factor",
+        "underlying_id",
+        "underlying_ticker",
+        "record_type",
+    ]
+
+    options = pd.DataFrame(option_records, columns=option_columns)
+
+    if not options.empty:
+        options = options.drop_duplicates(
+            "instrument_id",
+            keep="last",
         )
 
-    options = options[
-        options[
-            "underlying_ticker"
-        ].isin(ATIVOS_PILOTO)
-    ].copy()
+        for column in ("strike", "contract_size", "price_factor"):
+            options[column] = pd.to_numeric(
+                options[column],
+                errors="coerce",
+            )
+
+        for column in (
+            "maturity_date",
+            "trading_start_date",
+            "trading_end_date",
+        ):
+            options[column] = pd.to_datetime(
+                options[column],
+                errors="coerce",
+            )
+
+    # O chamador usa apenas len(instruments) para metadata.
+    instruments = pd.DataFrame(index=pd.RangeIndex(instrument_count))
 
     print(
-        f"    Cadastro concluído: {len(instruments):,} instrumentos; "
+        f"    Cadastro concluído: {instrument_count:,} instrumentos; "
         f"{len(options):,} opções dos ativos B3 monitorados; "
         f"{time.time() - started:.1f}s."
     )
 
-    return (
-        instruments.reset_index(drop=True),
-        options.reset_index(drop=True),
-    )
+    return instruments, options.reset_index(drop=True)
 
 
-def parse_price_report(path):
-    """Lê BVBG.086.01 PriceReport: preço, OI, bid/ask e negociação."""
+def parse_price_report(path, relevant_instrument_ids=None):
+    """Lê BVBG.086.01 PriceReport com filtro opcional de IDs relevantes.
+
+    A matemática não muda. Quando relevant_instrument_ids é informado,
+    o parser retém apenas opções monitoradas e respectivos ativos-objeto.
+    """
     ns = "{urn:bvmf.217.01.xsd}"
     records = []
     started = time.time()
     count = 0
+
+    relevant = (
+        set(str(x) for x in relevant_instrument_ids if pd.notna(x))
+        if relevant_instrument_ids is not None
+        else None
+    )
 
     context = etree.iterparse(
         str(path),
@@ -1283,49 +1301,38 @@ def parse_price_report(path):
     for _, element in context:
         count += 1
 
-        def value(name):
-            node = element.find(
-                f".//{ns}{name}"
-            )
-            return (
-                node.text.strip()
-                if node is not None
-                and node.text
-                else None
-            )
-
         instrument_id = child_text(
             element,
             f"./{ns}FinInstrmId/{ns}OthrId/{ns}Id",
         )
 
-        records.append(
-            {
-                "instrument_id": instrument_id,
-                "price_symbol": value("TckrSymb"),
-                "price_date": value("Dt"),
-                "open_interest": value("OpnIntrst"),
-                "best_bid": value("BestBidPric"),
-                "best_ask": value("BestAskPric"),
-                "first_price": value("FrstPric"),
-                "minimum_price": value("MinPric"),
-                "maximum_price": value("MaxPric"),
-                "average_price": value("TradAvrgPric"),
-                "last_price": value("LastPric"),
-                "trade_count": (
-                    value("RglrTxsQty")
-                    or value("TradQty")
-                ),
-                "traded_quantity": (
-                    value("RglrTraddCtrcts")
-                    or value("FinInstrmQty")
-                ),
-                "financial_volume": (
-                    value("NtlRglrVol")
-                    or value("NtlFinVol")
-                ),
-            }
-        )
+        if relevant is None or instrument_id in relevant:
+            def value(name):
+                node = element.find(f".//{ns}{name}")
+                return (
+                    node.text.strip()
+                    if node is not None and node.text
+                    else None
+                )
+
+            records.append(
+                {
+                    "instrument_id": instrument_id,
+                    "price_symbol": value("TckrSymb"),
+                    "price_date": value("Dt"),
+                    "open_interest": value("OpnIntrst"),
+                    "best_bid": value("BestBidPric"),
+                    "best_ask": value("BestAskPric"),
+                    "first_price": value("FrstPric"),
+                    "minimum_price": value("MinPric"),
+                    "maximum_price": value("MaxPric"),
+                    "average_price": value("TradAvrgPric"),
+                    "last_price": value("LastPric"),
+                    "trade_count": value("RglrTxsQty") or value("TradQty"),
+                    "traded_quantity": value("RglrTraddCtrcts") or value("FinInstrmQty"),
+                    "financial_volume": value("NtlRglrVol") or value("NtlFinVol"),
+                }
+            )
 
         element.clear()
         while element.getprevious() is not None:
@@ -1333,12 +1340,30 @@ def parse_price_report(path):
 
         if count % 20000 == 0:
             print(
-                f"    PriceReport: {count:,} registros..."
+                f"    PriceReport: {count:,} registros lidos; "
+                f"{len(records):,} relevantes..."
             )
 
     del context
 
-    prices = pd.DataFrame(records)
+    columns = [
+        "instrument_id",
+        "price_symbol",
+        "price_date",
+        "open_interest",
+        "best_bid",
+        "best_ask",
+        "first_price",
+        "minimum_price",
+        "maximum_price",
+        "average_price",
+        "last_price",
+        "trade_count",
+        "traded_quantity",
+        "financial_volume",
+    ]
+
+    prices = pd.DataFrame(records, columns=columns)
 
     numeric_columns = [
         "open_interest",
@@ -1365,40 +1390,24 @@ def parse_price_report(path):
         errors="coerce",
     )
 
-    prices["data_points"] = (
-        prices[numeric_columns]
-        .notna()
-        .sum(axis=1)
-    )
-
     prices = (
-        prices.sort_values(
-            [
-                "instrument_id",
-                "data_points",
-                "financial_volume",
-            ],
-            na_position="first",
-        )
-        .drop_duplicates(
+        prices.drop_duplicates(
             "instrument_id",
             keep="last",
-        )
-        .drop(
-            columns="data_points"
         )
         .reset_index(drop=True)
     )
 
     print(
-        f"    PriceReport concluído: {len(prices):,} instrumentos; "
-        f"{time.time() - started:.1f}s."
+        f"    PriceReport concluído: {count:,} registros lidos; "
+        f"{len(prices):,} retidos; {time.time() - started:.1f}s."
     )
 
     return prices
 
 
-def parse_reference_premium(path):
+def parse_reference_premium(path, relevant_symbols=None):
+    """Lê Prêmio de Referência com filtro opcional por símbolos relevantes."""
     columns = [
         "symbol",
         "reference_option_type",
@@ -1410,12 +1419,16 @@ def parse_reference_premium(path):
     ]
 
     if path is None or not Path(path).exists():
-        return pd.DataFrame(
-            columns=columns
-        )
+        return pd.DataFrame(columns=columns)
 
-    frame = pd.read_csv(
-        path,
+    relevant = (
+        set(str(x) for x in relevant_symbols if pd.notna(x))
+        if relevant_symbols is not None
+        else None
+    )
+
+    read_kwargs = dict(
+        filepath_or_buffer=path,
         sep=";",
         skiprows=1,
         names=columns,
@@ -1427,6 +1440,28 @@ def parse_reference_premium(path):
         },
         engine="python",
     )
+
+    if relevant is None:
+        frame = pd.read_csv(**read_kwargs)
+    else:
+        parts = []
+
+        for chunk in pd.read_csv(
+            **read_kwargs,
+            chunksize=25000,
+        ):
+            filtered = chunk[
+                chunk["symbol"].isin(relevant)
+            ]
+
+            if not filtered.empty:
+                parts.append(filtered)
+
+        frame = (
+            pd.concat(parts, ignore_index=True)
+            if parts
+            else pd.DataFrame(columns=columns)
+        )
 
     for column in (
         "reference_strike",
@@ -2763,17 +2798,29 @@ def run_full_pipeline(force=False):
         )
     )
 
+    relevant_price_ids = set(
+        options["instrument_id"].dropna().astype(str)
+    ) | set(
+        options["underlying_id"].dropna().astype(str)
+    )
+
     print("\nLendo PriceReport...")
     prices = parse_price_report(
-        price_xml
+        price_xml,
+        relevant_instrument_ids=relevant_price_ids,
+    )
+
+    relevant_reference_symbols = set(
+        options["symbol"].dropna().astype(str)
     )
 
     print("\nLendo Prêmio de Referência...")
     reference = parse_reference_premium(
-        reference_txt
+        reference_txt,
+        relevant_symbols=relevant_reference_symbols,
     )
     print(
-        f"    Prêmios de referência: {len(reference):,}."
+        f"    Prêmios de referência retidos: {len(reference):,}."
     )
 
     print("\nMontando universo utilizável...")
@@ -2783,9 +2830,18 @@ def run_full_pipeline(force=False):
         reference,
         selected_date,
     )
+
+    del prices
+    del reference
+    del relevant_price_ids
+    del relevant_reference_symbols
+    gc.collect()
     print(
         f"    Séries B3 monitoradas após filtros: {len(market_base):,}."
     )
+
+    del options
+    gc.collect()
 
     if market_base.empty:
         raise RuntimeError(
