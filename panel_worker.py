@@ -136,7 +136,7 @@ def main() -> int:
     # ------------------------------------------------------------------
     import gex_core as gex
 
-    log("Executando pipeline B3/GEX...")
+    log("Executando pipeline B3/GEX com ingestão otimizada para memória...")
     raw_series, metadata = gex.run_full_pipeline(force=args.force_gex)
 
     log(
