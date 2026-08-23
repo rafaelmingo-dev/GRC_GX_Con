@@ -246,7 +246,7 @@ col_title, col_btn = st.columns([7, 1])
 with col_title:
     st.title("GARCH × GEX — CONFLUÊNCIA V3")
     st.markdown(
-        '<div class="v3-sub">Principal W1 • Secundária W2/W3 • Mensal×30D • Semestral×90D • Semestral×180D • GARCH Anual</div>',
+        '<div class="v3-sub">Principal W1 • Secundária W2/W3 • Mensal×30D • Semestral×90D • Semestral×180D • GARCH Mensal/Semestral/Anual</div>',
         unsafe_allow_html=True,
     )
 
@@ -318,6 +318,7 @@ erros_worker = payload.get("erros", {})
 
 # Importados somente depois que o cache final existe.
 import confluence_core as core
+import garch_core as garch
 import plotly.graph_objects as go
 
 gc.collect()
@@ -327,15 +328,118 @@ gc.collect()
 # TABELAS / GRÁFICOS / DETALHES
 # ======================================================================================
 
+def bandas_garch_do_periodo(ativo_res, periodo):
+    """Obtém as bandas GARCH já calculadas e armazenadas no payload, sem recalcular o modelo."""
+    periodo = str(periodo).upper()
+
+    if periodo == "MENSAL":
+        bloco = ativo_res.get("blocos", {}).get("Mensal × 30D", {})
+        return bloco.get("bandas")
+
+    if periodo == "SEMESTRAL":
+        # 90D e 180D usam o mesmo GARCH Semestral. Preferimos 90D e usamos 180D como fallback.
+        for nome in ("Semestral × 90D", "Semestral × 180D"):
+            bloco = ativo_res.get("blocos", {}).get(nome, {})
+            bandas = bloco.get("bandas")
+            if bandas:
+                return bandas
+        return None
+
+    return None
+
+
+def leitura_garch_puro(ativo_res, periodo):
+    """Replica apenas a leitura de Banda/Distância/Status do GARCH original sobre bandas já prontas."""
+    periodo = str(periodo).upper()
+
+    if periodo == "ANUAL":
+        anual = ativo_res.get("anual")
+        if not anual:
+            return {
+                "banda": "SEM DADOS",
+                "dist_pct": np.nan,
+                "status": "SEM DADOS",
+            }
+        return {
+            "banda": anual.get("rotulo", "SEM DADOS"),
+            "dist_pct": core.numero_seguro(anual.get("dist_pct")),
+            "status": anual.get("status", "SEM DADOS"),
+        }
+
+    preco = core.numero_seguro(ativo_res.get("Preço GARCH"))
+    bandas = bandas_garch_do_periodo(ativo_res, periodo)
+
+    if not bandas or not np.isfinite(preco) or preco <= 0:
+        return {
+            "banda": "SEM DADOS",
+            "dist_pct": np.nan,
+            "status": "SEM DADOS",
+        }
+
+    try:
+        status, proxima, distancia, _prioridade = garch.analisar_status(
+            preco,
+            bandas,
+        )
+    except Exception:
+        return {
+            "banda": "SEM DADOS",
+            "dist_pct": np.nan,
+            "status": "SEM DADOS",
+        }
+
+    return {
+        "banda": proxima,
+        "dist_pct": core.numero_seguro(distancia),
+        "status": status,
+    }
+
+
+def adicionar_leituras_garch(df, resultados):
+    """Adiciona GARCH puro Mensal/Semestral ao radar sem alterar confluências nem o cache."""
+    if df.empty or "Ativo" not in df.columns:
+        return df
+
+    saida = df.copy()
+    mapa = {}
+
+    for ativo, ativo_res in resultados.items():
+        mapa[ativo] = {
+            "MENSAL": leitura_garch_puro(ativo_res, "MENSAL"),
+            "SEMESTRAL": leitura_garch_puro(ativo_res, "SEMESTRAL"),
+        }
+
+    for periodo, rotulo in (
+        ("MENSAL", "Mensal"),
+        ("SEMESTRAL", "Semestral"),
+    ):
+        saida[f"{rotulo} · Banda"] = saida["Ativo"].map(
+            lambda ativo: mapa.get(ativo, {}).get(periodo, {}).get("banda", "SEM DADOS")
+        )
+        saida[f"{rotulo} · Dist %"] = saida["Ativo"].map(
+            lambda ativo: mapa.get(ativo, {}).get(periodo, {}).get("dist_pct", np.nan)
+        )
+        saida[f"{rotulo} · Status"] = saida["Ativo"].map(
+            lambda ativo: mapa.get(ativo, {}).get(periodo, {}).get("status", "SEM DADOS")
+        )
+
+    return saida
+
+
 def tabela_principal(resultados):
-    df = core.dataframe_radar(resultados)
+    df = adicionar_leituras_garch(
+        core.dataframe_radar(resultados),
+        resultados,
+    )
 
     if df.empty:
         return df
 
     cols = [
         "Ativo", "Empresa", "Preço", "Spot GEX",
+        "Mensal · Banda", "Mensal · Dist %", "Mensal · Status",
         "30D · Principal", "30D · Confluência %", "30D · Preço→Confluência %", "30D · Qualidade",
+        "Semestral · Banda", "Semestral · Dist %", "Semestral · Status",
         "90D · Principal", "90D · Confluência %", "90D · Preço→Confluência %", "90D · Qualidade",
         "180D · Principal", "180D · Confluência %", "180D · Preço→Confluência %", "180D · Qualidade",
         "Anual · Banda", "Anual · Dist %", "Anual · Status",
@@ -361,6 +465,7 @@ def tabela_secundaria(resultados):
 
 
 def grafico_niveis(ativo_res, bloco_nome):
+    """Mapa vertical de níveis com contraste explícito para o tema escuro do Streamlit."""
     bloco = ativo_res["blocos"][bloco_nome]
     spot = core.numero_seguro(ativo_res.get("Spot GEX"))
     preco_garch = core.numero_seguro(ativo_res.get("Preço GARCH"))
@@ -368,67 +473,306 @@ def grafico_niveis(ativo_res, bloco_nome):
     p = bloco.get("principal")
     s = bloco.get("secundaria")
 
+    # Paleta explícita para não depender do tema automático do Plotly/Streamlit.
+    cor_fundo = "#0E1117"
+    cor_texto = "#F5F7FA"
+    cor_grid = "rgba(255,255,255,0.10)"
+    cor_garch = "#D0D7DE"
+    cor_principal = "#FFB000"
+    cor_secundaria = "#B388FF"
+    cor_spot = "#4CC9F0"
+    cor_preco = "#2DE2A6"
+
     fig = go.Figure()
+    niveis_validos = []
 
-    fig.add_trace(
-        go.Scatter(
-            x=["Spot GEX"],
-            y=[spot],
-            mode="markers+text",
-            text=[f"Spot GEX {fmt_num(spot)}"],
-            textposition="middle right",
-            name="Spot GEX",
-            marker=dict(size=13),
-        )
-    )
-
-    if np.isfinite(preco_garch):
-        fig.add_trace(
-            go.Scatter(
-                x=["Preço GARCH"],
-                y=[preco_garch],
-                mode="markers+text",
-                text=[f"Preço GARCH {fmt_num(preco_garch)}"],
-                textposition="middle right",
-                name="Preço GARCH",
-                marker=dict(size=11, symbol="diamond"),
-            )
-        )
-
+    # Quatro bandas do GARCH do período selecionado.
     for rotulo, chave in BANDAS_COMPARADAS:
         nivel = core.numero_seguro(bandas.get(chave))
-        if np.isfinite(nivel):
-            fig.add_hline(
-                y=nivel,
-                line_dash="dot",
-                annotation_text=f"GARCH {rotulo}: {fmt_num(nivel)}",
-            )
+        if not np.isfinite(nivel):
+            continue
+
+        niveis_validos.append(nivel)
+
+        fig.add_shape(
+            type="line",
+            xref="paper",
+            yref="y",
+            x0=0.08,
+            x1=0.92,
+            y0=nivel,
+            y1=nivel,
+            line=dict(
+                color=cor_garch,
+                width=2,
+                dash="dot",
+            ),
+            opacity=0.82,
+            layer="below",
+        )
+
+        fig.add_annotation(
+            x=0.98,
+            xref="paper",
+            y=nivel,
+            yref="y",
+            text=f"GARCH {rotulo} · {fmt_num(nivel)}",
+            showarrow=False,
+            xanchor="right",
+            yanchor="bottom",
+            font=dict(
+                color=cor_garch,
+                size=12,
+            ),
+            bgcolor="rgba(14,17,23,0.88)",
+            borderpad=2,
+        )
+
+    principal_nivel = np.nan
+    secundaria_nivel = np.nan
 
     if p:
-        nivel = core.numero_seguro(p.get("Nível Wall/Região"))
-        if np.isfinite(nivel):
-            fig.add_hline(
-                y=nivel,
-                line_width=3,
-                annotation_text=f"Principal {p['Wall/Região GEX']}: {fmt_num(nivel)}",
+        principal_nivel = core.numero_seguro(p.get("Nível Wall/Região"))
+        if np.isfinite(principal_nivel):
+            niveis_validos.append(principal_nivel)
+
+            fig.add_shape(
+                type="line",
+                xref="paper",
+                yref="y",
+                x0=0.06,
+                x1=0.94,
+                y0=principal_nivel,
+                y1=principal_nivel,
+                line=dict(
+                    color=cor_principal,
+                    width=4,
+                ),
+                layer="above",
             )
 
     if s:
-        nivel = core.numero_seguro(s.get("Nível Wall/Região"))
-        if np.isfinite(nivel):
-            fig.add_hline(
-                y=nivel,
-                line_dash="dash",
-                annotation_text=f"Secundária {s['Wall/Região GEX']}: {fmt_num(nivel)}",
+        secundaria_nivel = core.numero_seguro(s.get("Nível Wall/Região"))
+        if np.isfinite(secundaria_nivel):
+            niveis_validos.append(secundaria_nivel)
+
+            fig.add_shape(
+                type="line",
+                xref="paper",
+                yref="y",
+                x0=0.06,
+                x1=0.94,
+                y0=secundaria_nivel,
+                y1=secundaria_nivel,
+                line=dict(
+                    color=cor_secundaria,
+                    width=3,
+                    dash="dash",
+                ),
+                layer="above",
             )
 
+    if np.isfinite(spot):
+        niveis_validos.append(spot)
+        fig.add_trace(
+            go.Scatter(
+                x=[0.38],
+                y=[spot],
+                mode="markers",
+                name="Spot GEX",
+                marker=dict(
+                    size=14,
+                    color=cor_spot,
+                    line=dict(color=cor_fundo, width=2),
+                ),
+                hovertemplate=f"Spot GEX: {fmt_num(spot)}<extra></extra>",
+            )
+        )
+
+    if np.isfinite(preco_garch):
+        niveis_validos.append(preco_garch)
+        fig.add_trace(
+            go.Scatter(
+                x=[0.62],
+                y=[preco_garch],
+                mode="markers",
+                name="Preço GARCH",
+                marker=dict(
+                    size=13,
+                    symbol="diamond",
+                    color=cor_preco,
+                    line=dict(color=cor_fundo, width=2),
+                ),
+                hovertemplate=f"Preço GARCH: {fmt_num(preco_garch)}<extra></extra>",
+            )
+        )
+
+    # Enquadramento vertical somente com os níveis realmente existentes.
+    if niveis_validos:
+        minimo = float(min(niveis_validos))
+        maximo = float(max(niveis_validos))
+        amplitude = maximo - minimo
+        referencia = max(abs(minimo), abs(maximo), 1.0)
+        margem = max(amplitude * 0.08, referencia * 0.015)
+        if amplitude <= 0:
+            margem = max(referencia * 0.03, 0.50)
+        faixa_y = [minimo - margem, maximo + margem]
+    else:
+        faixa_y = None
+
+    # Quando dois níveis quase coincidem, deslocamos somente os rótulos para preservar leitura.
+    amplitude_rotulos = (
+        float(max(niveis_validos) - min(niveis_validos))
+        if len(niveis_validos) >= 2
+        else 0.0
+    )
+    limiar_proximidade = max(amplitude_rotulos * 0.035, 0.05)
+
+    principal_shift = 0
+    secundaria_shift = 0
+    if (
+        np.isfinite(principal_nivel)
+        and np.isfinite(secundaria_nivel)
+        and abs(principal_nivel - secundaria_nivel) <= limiar_proximidade
+    ):
+        principal_shift = 14
+        secundaria_shift = -14
+
+    if np.isfinite(principal_nivel):
+        fig.add_annotation(
+            x=0.02,
+            xref="paper",
+            y=principal_nivel,
+            yref="y",
+            text=(
+                f"Principal {p['Wall/Região GEX']} · "
+                f"{fmt_num(principal_nivel)}"
+            ),
+            showarrow=False,
+            xanchor="left",
+            yanchor="middle",
+            yshift=principal_shift,
+            font=dict(
+                color=cor_principal,
+                size=12,
+            ),
+            bgcolor="rgba(14,17,23,0.92)",
+            bordercolor=cor_principal,
+            borderwidth=1,
+            borderpad=3,
+        )
+
+    if np.isfinite(secundaria_nivel):
+        fig.add_annotation(
+            x=0.02,
+            xref="paper",
+            y=secundaria_nivel,
+            yref="y",
+            text=(
+                f"Secundária {s['Wall/Região GEX']} · "
+                f"{fmt_num(secundaria_nivel)}"
+            ),
+            showarrow=False,
+            xanchor="left",
+            yanchor="middle",
+            yshift=secundaria_shift,
+            font=dict(
+                color=cor_secundaria,
+                size=12,
+            ),
+            bgcolor="rgba(14,17,23,0.92)",
+            bordercolor=cor_secundaria,
+            borderwidth=1,
+            borderpad=3,
+        )
+
+    spot_shift = 18
+    preco_shift = 18
+    if (
+        np.isfinite(spot)
+        and np.isfinite(preco_garch)
+        and abs(spot - preco_garch) <= limiar_proximidade
+    ):
+        spot_shift = 20
+        preco_shift = -22
+
+    if np.isfinite(spot):
+        fig.add_annotation(
+            x=0.38,
+            y=spot,
+            text=f"Spot GEX · {fmt_num(spot)}",
+            showarrow=False,
+            yshift=spot_shift,
+            font=dict(
+                color=cor_spot,
+                size=12,
+            ),
+            bgcolor="rgba(14,17,23,0.88)",
+            borderpad=2,
+        )
+
+    if np.isfinite(preco_garch):
+        fig.add_annotation(
+            x=0.62,
+            y=preco_garch,
+            text=f"Preço GARCH · {fmt_num(preco_garch)}",
+            showarrow=False,
+            yshift=preco_shift,
+            font=dict(
+                color=cor_preco,
+                size=12,
+            ),
+            bgcolor="rgba(14,17,23,0.88)",
+            borderpad=2,
+        )
+
+    fig.update_xaxes(
+        visible=False,
+        range=[0.0, 1.0],
+        fixedrange=True,
+    )
+
+    fig.update_yaxes(
+        title="Preço",
+        range=faixa_y,
+        gridcolor=cor_grid,
+        gridwidth=1,
+        zeroline=False,
+        tickfont=dict(
+            color=cor_texto,
+            size=12,
+        ),
+        title_font=dict(
+            color=cor_texto,
+            size=13,
+        ),
+        automargin=True,
+    )
+
     fig.update_layout(
-        title=f"{ativo_res['Ativo']} — {bloco_nome}",
-        xaxis_title="Referências",
-        yaxis_title="Preço",
-        height=560,
-        margin=dict(l=40, r=40, t=70, b=40),
-        showlegend=True,
+        title=dict(
+            text=f"{ativo_res['Ativo']} — {bloco_nome}",
+            font=dict(
+                color=cor_texto,
+                size=18,
+            ),
+            x=0.01,
+            xanchor="left",
+        ),
+        height=540,
+        margin=dict(
+            l=60,
+            r=28,
+            t=65,
+            b=25,
+        ),
+        paper_bgcolor=cor_fundo,
+        plot_bgcolor=cor_fundo,
+        font=dict(
+            color=cor_texto,
+        ),
+        showlegend=False,
+        hovermode="closest",
     )
 
     return fig
@@ -515,7 +859,8 @@ def gerar_zip_csv(resultados):
         resultados,
     )
 
-    radar = core.dataframe_radar(
+    radar = adicionar_leituras_garch(
+        core.dataframe_radar(resultados),
         resultados,
     )
 
@@ -588,7 +933,9 @@ with tab1:
 
     st.caption(
         "Ordenação relativa: menor confluência principal disponível primeiro. "
-        "Ainda não há classificação Forte/Moderada/Fraca."
+        "Mensal/Semestral/Anual · Banda/Dist/Status = leitura do GARCH puro pelo Preço GARCH. "
+        "30D/90D/180D · Principal = banda GARCH escolhida pela proximidade com a W1; "
+        "as duas bandas podem ser diferentes. Ainda não há classificação Forte/Moderada/Fraca."
     )
 
     dataframe_display(
@@ -641,9 +988,13 @@ with tab2:
             "Vencimentos GEX",
         ]
 
-        dataframe_display(
-            sec[[c for c in cols if c in sec.columns]]
-        )
+        with st.expander(
+            "Ver detalhes completos da Secundária W2/W3",
+            expanded=False,
+        ):
+            dataframe_display(
+                sec[[c for c in cols if c in sec.columns]]
+            )
 
 
 with tab3:
@@ -716,12 +1067,23 @@ with tab3:
         bloco.get("secundaria"),
     )
 
+    st.markdown("#### Mapa de níveis")
+    st.caption(
+        "O gráfico mostra as quatro bandas GARCH do período, Principal W1, Secundária W2/W3, "
+        "Spot GEX e Preço GARCH. A banda usada na confluência é a que ficou mais próxima da Wall/Região, "
+        "não necessariamente a banda GARCH mais próxima do preço."
+    )
+
     st.plotly_chart(
         grafico_niveis(
             ativo_res,
             bloco_nome,
         ),
         use_container_width=True,
+        config={
+            "displayModeBar": False,
+            "responsive": True,
+        },
     )
 
     todas = pd.DataFrame(
@@ -815,7 +1177,9 @@ with tab4:
 - **Mensal GARCH × GEX 30D**.
 - **Semestral GARCH × GEX 90D**.
 - **Semestral GARCH × GEX 180D**.
-- **GARCH Anual:** permanece sozinho.
+- **GARCH puro Mensal/Semestral/Anual:** Banda, Distância e Status usam a leitura original do GARCH em relação ao Preço GARCH.
+- **Banda da confluência:** é a banda GARCH que ficou mais próxima da Wall/Região GEX do bloco e pode ser diferente da banda GARCH mais próxima do preço.
+- **GARCH Anual:** permanece sem contraparte GEX.
 - **GEX 60D:** não participa deste painel conjunto.
 - **Confluência GARCH × GEX (%):** `|Wall/Região GEX − Banda GARCH| / Spot GEX × 100`.
 - **Distância do preço à confluência:** distância do Spot GEX até o intervalo entre a Banda e a Wall/Região. Se o spot estiver dentro do intervalo, é zero.
