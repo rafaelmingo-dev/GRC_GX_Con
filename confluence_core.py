@@ -222,10 +222,19 @@ def construir_regioes_gex_v3(metrics, ranks, camada):
     return regioes
 
 
-def metricas_zona_v3(spot, banda, nivel_gex):
-    spot = numero_seguro(spot)
+def metricas_zona_v3(preco_atual, banda, nivel_gex, spot_gex):
+    """Mede a posição do preço atual em relação à zona Banda GARCH ↔ Wall GEX.
+
+    Regras preservadas:
+    - a zona continua sendo [min(banda, wall), max(banda, wall)];
+    - a largura percentual da zona continua normalizada pelo Spot GEX, como antes;
+    - somente as métricas de POSIÇÃO/DISTÂNCIA DO PREÇO passam a usar o Preço atual
+      independente, conforme definido para esta versão.
+    """
+    preco_atual = numero_seguro(preco_atual)
     banda = numero_seguro(banda)
     nivel_gex = numero_seguro(nivel_gex)
+    spot_gex = numero_seguro(spot_gex)
 
     vazio = {
         "Zona inferior": np.nan,
@@ -233,15 +242,16 @@ def metricas_zona_v3(spot, banda, nivel_gex):
         "Centro da zona": np.nan,
         "Largura zona R$": np.nan,
         "Largura zona %": np.nan,
-        "Spot dentro da zona": False,
-        "Dist Spot→Zona R$": np.nan,
-        "Dist Spot→Zona %": np.nan,
-        "Dist Spot→Centro R$": np.nan,
-        "Dist Spot→Centro %": np.nan,
-        "Dist Spot→Centro % assinada": np.nan,
-        "Posição da zona vs Spot": "SEM DADOS",
+        "Preço atual dentro da zona": False,
+        "Dist Preço→Zona R$": np.nan,
+        "Dist Preço→Zona %": np.nan,
+        "Dist Preço→Centro R$": np.nan,
+        "Dist Preço→Centro %": np.nan,
+        "Dist Preço→Centro % assinada": np.nan,
+        "Posição da zona vs Preço": "SEM DADOS",
     }
-    if not (np.isfinite(spot) and spot > 0 and np.isfinite(banda) and np.isfinite(nivel_gex)):
+
+    if not (np.isfinite(banda) and np.isfinite(nivel_gex)):
         return vazio
 
     inferior = float(min(banda, nivel_gex))
@@ -249,39 +259,82 @@ def metricas_zona_v3(spot, banda, nivel_gex):
     centro = float((inferior + superior) / 2.0)
     largura = float(superior - inferior)
 
-    if inferior <= spot <= superior:
-        dentro, dist_zona, posicao = True, 0.0, "SPOT DENTRO DA ZONA"
-    elif spot < inferior:
-        dentro, dist_zona, posicao = False, float(inferior - spot), "ZONA ACIMA DO SPOT"
-    else:
-        dentro, dist_zona, posicao = False, float(spot - superior), "ZONA ABAIXO DO SPOT"
+    largura_pct = (
+        float(largura / spot_gex * 100.0)
+        if np.isfinite(spot_gex) and spot_gex > 0
+        else np.nan
+    )
 
-    dist_centro_assinada = float((centro / spot - 1.0) * 100.0)
+    if not np.isfinite(preco_atual) or preco_atual <= 0:
+        vazio.update(
+            {
+                "Zona inferior": inferior,
+                "Zona superior": superior,
+                "Centro da zona": centro,
+                "Largura zona R$": largura,
+                "Largura zona %": largura_pct,
+            }
+        )
+        return vazio
+
+    if inferior <= preco_atual <= superior:
+        dentro, dist_zona, posicao = True, 0.0, "PREÇO ATUAL DENTRO DA ZONA"
+    elif preco_atual < inferior:
+        dentro, dist_zona, posicao = (
+            False,
+            float(inferior - preco_atual),
+            "ZONA ACIMA DO PREÇO ATUAL",
+        )
+    else:
+        dentro, dist_zona, posicao = (
+            False,
+            float(preco_atual - superior),
+            "ZONA ABAIXO DO PREÇO ATUAL",
+        )
+
+    dist_centro_assinada = float((centro / preco_atual - 1.0) * 100.0)
+
     return {
         "Zona inferior": inferior,
         "Zona superior": superior,
         "Centro da zona": centro,
         "Largura zona R$": largura,
-        "Largura zona %": float(largura / spot * 100.0),
-        "Spot dentro da zona": dentro,
-        "Dist Spot→Zona R$": dist_zona,
-        "Dist Spot→Zona %": float(dist_zona / spot * 100.0),
-        "Dist Spot→Centro R$": float(abs(centro - spot)),
-        "Dist Spot→Centro %": float(abs(dist_centro_assinada)),
-        "Dist Spot→Centro % assinada": dist_centro_assinada,
-        "Posição da zona vs Spot": posicao,
+        "Largura zona %": largura_pct,
+        "Preço atual dentro da zona": dentro,
+        "Dist Preço→Zona R$": dist_zona,
+        "Dist Preço→Zona %": float(dist_zona / preco_atual * 100.0),
+        "Dist Preço→Centro R$": float(abs(centro - preco_atual)),
+        "Dist Preço→Centro %": float(abs(dist_centro_assinada)),
+        "Dist Preço→Centro % assinada": dist_centro_assinada,
+        "Posição da zona vs Preço": posicao,
     }
 
 
 def comparar_bandas_regioes_v3(
-    ativo, bloco, bandas, metrics, preco_garch, camada, ranks
+    ativo,
+    bloco,
+    bandas,
+    metrics,
+    preco_garch,
+    preco_atual,
+    fonte_preco_atual,
+    momento_preco_atual,
+    camada,
+    ranks,
 ):
+    """Compara bandas GARCH com regiões GEX sem alterar a métrica de confluência.
+
+    A confluência estrutural continua normalizada pelo Spot GEX.
+    A distância do mercado à zona usa exclusivamente o Preço atual independente.
+    """
     if bandas is None or metrics is None:
         return [], []
+
     spot = numero_seguro(metrics.get("spot"))
     if not np.isfinite(spot) or spot <= 0:
         return [], []
 
+    preco_atual = numero_seguro(preco_atual)
     quality = metrics.get("quality") or {}
     quality_score = numero_seguro(quality.get("score"))
     quality_label = str(quality.get("label", "N/D"))
@@ -295,6 +348,9 @@ def comparar_bandas_regioes_v3(
             "Bloco": bloco["bloco"],
             "GARCH período": bloco["garch_periodo"],
             "GEX horizonte": bloco["gex_horizonte"],
+            "Preço atual": preco_atual,
+            "Fonte preço atual": fonte_preco_atual,
+            "Momento preço atual": momento_preco_atual,
             "Preço GARCH": numero_seguro(preco_garch),
             "Spot GEX": spot,
             "Camada": camada,
@@ -311,9 +367,20 @@ def comparar_bandas_regioes_v3(
             banda_nivel = numero_seguro(bandas.get(banda_chave))
             if not (np.isfinite(banda_nivel) and np.isfinite(nivel_gex)):
                 continue
+
             diferenca_reais = float(abs(nivel_gex - banda_nivel))
+
+            # REGRA V3 PRESERVADA: a proximidade estrutural Banda↔Wall continua
+            # normalizada pelo Spot GEX. O Preço atual NÃO entra nesta fórmula.
             diferenca_pct = float(diferenca_reais / spot * 100.0)
-            zona = metricas_zona_v3(spot, banda_nivel, nivel_gex)
+
+            zona = metricas_zona_v3(
+                preco_atual,
+                banda_nivel,
+                nivel_gex,
+                spot,
+            )
+
             comparacoes.append(
                 {
                     **base_regiao,
@@ -419,13 +486,27 @@ def calcular_confluencia_ativo(
     ativo: str,
     garch_resultado: dict[str, Any],
     gex_reference_date: pd.Timestamp,
+    preco_atual: float = np.nan,
+    fonte_preco_atual: str | None = None,
+    momento_preco_atual: Any = pd.NaT,
 ) -> dict[str, Any]:
-    """Calcula a V3 de um único ativo B3."""
+    """Calcula a V3 de um único ativo B3.
+
+    Três referências de preço ficam deliberadamente separadas:
+    - Preço atual: cotação independente usada somente para distância/posição da zona;
+    - Preço GARCH: cotação usada pela leitura do motor GARCH;
+    - Spot GEX: referência interna da base GEX e denominador da confluência estrutural.
+    """
     preco_garch = numero_seguro(garch_resultado.get("preco"))
+    preco_atual = numero_seguro(preco_atual)
+
     retorno = {
         "Ativo": ativo,
         "Empresa": garch.ATIVOS[ativo]["nome"],
         "Setor": garch.ATIVOS[ativo]["setor"],
+        "Preço atual": preco_atual,
+        "Fonte preço atual": fonte_preco_atual or "N/D",
+        "Momento preço atual": momento_preco_atual,
         "Preço GARCH": preco_garch,
         "Fonte preço GARCH": garch_resultado.get("intervalo"),
         "Momento preço GARCH": garch_resultado.get("momento", pd.NaT),
@@ -452,11 +533,30 @@ def calcular_confluencia_ativo(
         _, metrics = gex.get_metrics(ativo, bloco["gex_horizonte"])
 
         regs_p, comps_p = comparar_bandas_regioes_v3(
-            ativo, bloco, bandas, metrics, preco_garch, "PRINCIPAL W1", {1}
+            ativo,
+            bloco,
+            bandas,
+            metrics,
+            preco_garch,
+            preco_atual,
+            fonte_preco_atual,
+            momento_preco_atual,
+            "PRINCIPAL W1",
+            {1},
         )
         regs_s, comps_s = comparar_bandas_regioes_v3(
-            ativo, bloco, bandas, metrics, preco_garch, "SECUNDÁRIA W2/W3", {2, 3}
+            ativo,
+            bloco,
+            bandas,
+            metrics,
+            preco_garch,
+            preco_atual,
+            fonte_preco_atual,
+            momento_preco_atual,
+            "SECUNDÁRIA W2/W3",
+            {2, 3},
         )
+
         retorno["blocos"][bloco["bloco"]] = {
             "config": bloco,
             "bandas": bandas,
@@ -470,7 +570,8 @@ def calcular_confluencia_ativo(
         }
 
     retorno["anual"] = resultado_anual_garch(
-        preco_garch, garch_resultado.get("bandas", {}).get("ANUAL")
+        preco_garch,
+        garch_resultado.get("bandas", {}).get("ANUAL"),
     )
     return retorno
 
@@ -486,8 +587,9 @@ def linha_radar(ativo_resultado: dict[str, Any]) -> dict[str, Any]:
     row = {
         "Ativo": ativo_resultado["Ativo"],
         "Empresa": ativo_resultado["Empresa"],
-        "Preço": ativo_resultado["Preço GARCH"],
-        "Spot GEX": ativo_resultado["Spot GEX"],
+        "Preço atual": ativo_resultado.get("Preço atual", np.nan),
+        "Preço GARCH": ativo_resultado.get("Preço GARCH", np.nan),
+        "Spot GEX": ativo_resultado.get("Spot GEX", np.nan),
     }
 
     mapa = [
@@ -495,6 +597,7 @@ def linha_radar(ativo_resultado: dict[str, Any]) -> dict[str, Any]:
         ("90D", "Semestral × 90D"),
         ("180D", "Semestral × 180D"),
     ]
+
     for curto, nome in mapa:
         bloco = ativo_resultado["blocos"].get(nome, {})
         p = bloco.get("principal")
@@ -504,8 +607,8 @@ def linha_radar(ativo_resultado: dict[str, Any]) -> dict[str, Any]:
         row[f"{curto} · Confluência %"] = (
             numero_seguro(p.get("Diferença Wall↔Banda %")) if p else np.nan
         )
-        row[f"{curto} · Preço→Confluência %"] = (
-            numero_seguro(p.get("Dist Spot→Zona %")) if p else np.nan
+        row[f"{curto} · Dist Preço→Zona %"] = (
+            numero_seguro(p.get("Dist Preço→Zona %")) if p else np.nan
         )
         row[f"{curto} · Qualidade"] = (
             str(p.get("Classe qualidade", "N/D")) if p else "N/D"
