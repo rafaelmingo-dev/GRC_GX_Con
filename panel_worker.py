@@ -25,6 +25,26 @@ def mem_max_mb() -> float:
         return float("nan")
 
 
+def mem_current_mb() -> float:
+    """RSS atual no Linux/Streamlit Cloud, sem dependência externa."""
+    try:
+        with open("/proc/self/status", "r", encoding="utf-8") as status_file:
+            for line in status_file:
+                if line.startswith("VmRSS:"):
+                    return float(line.split()[1]) / 1024.0
+    except Exception:
+        pass
+    return float("nan")
+
+
+def mem_text() -> str:
+    atual = mem_current_mb()
+    pico = mem_max_mb()
+    atual_txt = f"{atual:.1f} MB" if pd.notna(atual) else "N/D"
+    pico_txt = f"{pico:.1f} MB" if pd.notna(pico) else "N/D"
+    return f"mem_atual={atual_txt} | mem_pico={pico_txt}"
+
+
 def log(msg: str) -> None:
     print(f"[V3 WORKER] {msg}", flush=True)
 
@@ -40,7 +60,12 @@ def sha256_file(path: Path) -> str:
 def core_hashes(module_dir: Path) -> dict[str, str]:
     return {
         nome: sha256_file(module_dir / nome)
-        for nome in ("gex_core.py", "garch_core.py", "confluence_core.py")
+        for nome in (
+            "gex_core.py",
+            "garch_core.py",
+            "confluence_core.py",
+            "panel_worker.py",
+        )
     }
 
 
@@ -128,7 +153,7 @@ def main() -> int:
 
     log(
         f"Início | force_gex={args.force_gex} | "
-        f"Python={sys.version.split()[0]} | mem_max={mem_max_mb():.1f} MB"
+        f"Python={sys.version.split()[0]} | {mem_text()}"
     )
 
     # ------------------------------------------------------------------
@@ -141,26 +166,32 @@ def main() -> int:
 
     log(
         f"Pipeline B3 concluído | raw_series={len(raw_series):,} | "
-        f"base={metadata.get('reference_date')} | mem_max={mem_max_mb():.1f} MB"
+        f"base={metadata.get('reference_date')} | {mem_text()}"
     )
 
     # load_complete_bundle() faria este prepare_panel_data(), mas também
     # carregaria o COTAHIST. O painel conjunto não precisa do COTAHIST.
-    prepared = gex.prepare_panel_data(raw_series)
+    # O worker possui raw_series exclusivamente. Preparar no próprio DataFrame
+    # evita manter raw_series + uma cópia completa simultaneamente.
+    prepared = gex.prepare_panel_data(
+        raw_series,
+        copy_frame=False,
+    )
     del raw_series
     gc.collect()
 
     log(
         f"GEX preparado | linhas={len(prepared):,} | "
-        f"mem_max={mem_max_mb():.1f} MB"
+        f"{mem_text()}"
     )
 
     instalar_runtime_gex_sem_copia(gex, prepared, metadata)
+    del prepared
     gc.collect()
 
     log(
         "Runtime GEX instalado sem segunda preparação/cópia | "
-        f"mem_max={mem_max_mb():.1f} MB"
+        f"{mem_text()}"
     )
 
     # ------------------------------------------------------------------
@@ -180,7 +211,7 @@ def main() -> int:
 
     log(
         f"Calculando {len(ativos_comuns)} ativos GARCH × GEX | "
-        f"mem_max={mem_max_mb():.1f} MB"
+        f"{mem_text()}"
     )
 
     resultados = {}
@@ -189,7 +220,7 @@ def main() -> int:
     for i, ativo in enumerate(ativos_comuns, start=1):
         log(
             f"GARCH {i:02d}/{len(ativos_comuns):02d} — {ativo} iniciando | "
-            f"mem_max={mem_max_mb():.1f} MB"
+            f"{mem_text()}"
         )
 
         try:
@@ -217,11 +248,15 @@ def main() -> int:
             log(f"{ativo} falhou na confluência: {erros[ativo]}")
         finally:
             del gd
+            # Cada ativo usa seu próprio conjunto de chains. O resultado de
+            # confluência já foi construído; manter as chains no cache do GEX
+            # até o fim dos 20 ativos só aumenta RAM sem mudar nenhum valor.
+            gex.invalidate_metrics_cache()
             gc.collect()
 
         log(
             f"{ativo} concluído | resultados={len(resultados)} | "
-            f"mem_max={mem_max_mb():.1f} MB"
+            f"{mem_text()}"
         )
 
     if not resultados:
@@ -247,6 +282,7 @@ def main() -> int:
         "worker_info": {
             "python": sys.version,
             "elapsed_seconds": time.time() - started,
+            "mem_current_mb": mem_current_mb(),
             "mem_max_mb": mem_max_mb(),
             "ativos_comuns": len(ativos_comuns),
             "ativos_calculados": len(resultados),
@@ -262,7 +298,7 @@ def main() -> int:
         f"Cache final salvo: {output.name} | "
         f"ativos={len(resultados)} | "
         f"tempo={time.time() - started:.1f}s | "
-        f"mem_max={mem_max_mb():.1f} MB"
+        f"{mem_text()}"
     )
     log("CONCLUÍDO.")
     return 0
