@@ -269,23 +269,34 @@ def dataframe_display(df):
 # CABEÇALHO
 # ======================================================================================
 
-col_title, col_btn = st.columns([7, 1])
-
-with col_title:
-    st.title("GARCH × GEX — CONFLUÊNCIA V3")
-    st.markdown(
-        '<div class="v3-sub">Radar W1 • Walls W2/W3 • Mensal×30D • Semestral×90D • Semestral×180D • GARCH Mensal/Semestral/Anual</div>',
-        unsafe_allow_html=True,
-    )
+st.title("GARCH × GEX — CONFLUÊNCIA V3")
+st.markdown(
+    '<div class="v3-sub">Radar W1 • Walls W2/W3 • Mensal×30D • Semestral×90D • Semestral×180D • GARCH Mensal/Semestral/Anual</div>',
+    unsafe_allow_html=True,
+)
 
 payload, cache_error = carregar_cache()
 
-with col_btn:
-    atualizar = (
-        st.button("↻ Atualizar", use_container_width=True)
-        if payload is not None
-        else False
-    )
+# Quando já existe cache válido, a atualização fica em uma linha própria,
+# com botão primário e largura suficiente para permanecer visível no tablet.
+# A lógica continua igual: o clique chama o worker com force_gex=True.
+atualizar = False
+if payload is not None:
+    col_atualizar, col_ultima_atualizacao = st.columns([2, 5])
+
+    with col_atualizar:
+        atualizar = st.button(
+            "🔄 ATUALIZAR PAINEL",
+            type="primary",
+            use_container_width=True,
+            key="atualizar_painel",
+        )
+
+    with col_ultima_atualizacao:
+        st.caption(
+            f"Última atualização do painel: "
+            f"{fmt_momento(payload.get('generated_at'))}"
+        )
 
 # O app abre sem disparar o pipeline pesado.
 if payload is None:
@@ -555,7 +566,7 @@ def _texto_confluencia_radar(conf_pct, dist_preco_pct):
 
     if np.isfinite(dist_preco):
         if np.isclose(dist_preco, 0.0, atol=1e-12, rtol=0.0):
-            return f"Conf {conf_txt} · 🎯 NA ZONA"
+            return f"Conf {conf_txt} · 🎯 PREÇO DENTRO DA ZONA"
         return f"Conf {conf_txt} · Dist. zona {fmt_pct(dist_preco)}"
 
     return f"Conf {conf_txt} · Dist. zona N/D"
@@ -573,7 +584,7 @@ def tabela_radar_w1(resultados):
 
     visual = pd.DataFrame(index=base.index)
     visual["Ativo"] = base["Ativo"]
-    visual["Preço"] = pd.to_numeric(base["Preço atual"], errors="coerce")
+    visual["Preço atual"] = pd.to_numeric(base["Preço atual"], errors="coerce")
 
     mapa = (
         ("30D — Mensal", "30D"),
@@ -682,8 +693,8 @@ def dataframe_radar_w1(resultados):
                 "Ativo",
                 width="small",
             ),
-            "Preço": st.column_config.NumberColumn(
-                "Preço",
+            "Preço atual": st.column_config.NumberColumn(
+                "Preço atual",
                 format="%.2f",
                 width="small",
             ),
@@ -1182,7 +1193,7 @@ with tab1:
         "Cada horizonte mostra duas métricas: "
         "Conf = distância entre Banda GARCH e W1, mantendo o Spot GEX como denominador da regra V3; "
         "Dist. zona = distância do Preço atual independente até a zona formada por Banda e W1. "
-        "🎯 NA ZONA aparece somente quando o Preço atual está dentro desse intervalo. "
+        "🎯 PREÇO DENTRO DA ZONA aparece somente quando o Preço atual está dentro desse intervalo. "
         "O fundo verde é apenas intensidade visual contínua da própria Conf %, sem faixas Forte/Moderada/Fraca."
     )
 
