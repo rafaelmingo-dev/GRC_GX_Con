@@ -16,7 +16,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-CACHE_SCHEMA = 3
+CACHE_SCHEMA = 4
 MODULE_DIR = Path(__file__).resolve().parent
 CACHE_DIR = MODULE_DIR / ".panel_cache"
 CACHE_FILE = CACHE_DIR / "painel_v3.pkl"
@@ -233,14 +233,28 @@ def fmt_gamma(v):
         return "—"
 
 
+def fmt_momento(v, vazio="N/D"):
+    try:
+        ts = pd.Timestamp(v)
+        if pd.isna(ts):
+            return vazio
+        if ts.tzinfo is not None:
+            ts = ts.tz_convert("America/Sao_Paulo").tz_localize(None)
+        return ts.strftime("%d/%m/%Y %H:%M")
+    except Exception:
+        return vazio
+
+
 def dataframe_display(df):
     formatos = {}
 
     for col in df.columns:
-        if "Preço" in col or col == "Spot GEX":
-            formatos[col] = st.column_config.NumberColumn(format="%.2f")
-        elif "%" in col or "Dist" in col:
+        # Percentuais têm prioridade: nomes como "Dist Preço→Zona %" também
+        # contêm a palavra Preço e não podem ser formatados como valor em R$.
+        if "%" in col:
             formatos[col] = st.column_config.NumberColumn(format="%.2f%%")
+        elif "Preço" in col or col == "Spot GEX":
+            formatos[col] = st.column_config.NumberColumn(format="%.2f")
 
     st.dataframe(
         df,
@@ -455,12 +469,12 @@ def tabela_principal(resultados):
         return df
 
     cols = [
-        "Ativo", "Empresa", "Preço", "Spot GEX",
+        "Ativo", "Empresa", "Preço atual", "Preço GARCH", "Spot GEX",
         "Mensal · Banda", "Mensal · Dist %", "Mensal · Status",
-        "30D · Principal", "30D · Confluência %", "30D · Preço→Confluência %", "30D · Qualidade",
+        "30D · Principal", "30D · Confluência %", "30D · Dist Preço→Zona %", "30D · Qualidade",
         "Semestral · Banda", "Semestral · Dist %", "Semestral · Status",
-        "90D · Principal", "90D · Confluência %", "90D · Preço→Confluência %", "90D · Qualidade",
-        "180D · Principal", "180D · Confluência %", "180D · Preço→Confluência %", "180D · Qualidade",
+        "90D · Principal", "90D · Confluência %", "90D · Dist Preço→Zona %", "90D · Qualidade",
+        "180D · Principal", "180D · Confluência %", "180D · Dist Preço→Zona %", "180D · Qualidade",
         "Anual · Banda", "Anual · Dist %", "Anual · Status",
     ]
 
@@ -508,7 +522,7 @@ def tabela_garch_puro(resultados):
         rows.append(
             {
                 "Ativo": ativo,
-                "Preço": core.numero_seguro(ativo_res.get("Preço GARCH")),
+                "Preço GARCH": core.numero_seguro(ativo_res.get("Preço GARCH")),
                 "Mensal": _texto_garch_resumido(
                     leitura_garch_puro(ativo_res, "MENSAL")
                 ),
@@ -527,10 +541,9 @@ def tabela_garch_puro(resultados):
 def _texto_confluencia_radar(conf_pct, dist_preco_pct):
     """Texto operacional de uma célula do Radar W1.
 
-    Conf = distância Banda GARCH ↔ W1.
-    Preço = distância do Spot GEX até a zona entre Banda e W1.
-    O alvo aparece somente quando a própria métrica existente é zero,
-    isto é, quando o Spot está dentro da zona.
+    Conf = distância Banda GARCH ↔ W1, normalizada pelo Spot GEX.
+    Dist. zona = distância do Preço atual independente até a zona Banda↔W1.
+    O alvo aparece somente quando o Preço atual está dentro da zona.
     """
     conf = core.numero_seguro(conf_pct)
     dist_preco = core.numero_seguro(dist_preco_pct)
@@ -542,14 +555,14 @@ def _texto_confluencia_radar(conf_pct, dist_preco_pct):
 
     if np.isfinite(dist_preco):
         if np.isclose(dist_preco, 0.0, atol=1e-12, rtol=0.0):
-            return f"Conf {conf_txt} · 🎯 PREÇO NA ZONA"
-        return f"Conf {conf_txt} · Preço {fmt_pct(dist_preco)}"
+            return f"Conf {conf_txt} · 🎯 NA ZONA"
+        return f"Conf {conf_txt} · Dist. zona {fmt_pct(dist_preco)}"
 
-    return f"Conf {conf_txt} · Preço N/D"
+    return f"Conf {conf_txt} · Dist. zona N/D"
 
 
 def tabela_radar_w1(resultados):
-    """Radar operacional enxuto: Ativo, Preço e os três horizontes W1.
+    """Radar operacional enxuto: Ativo, Preço atual e os três horizontes W1.
 
     A tabela técnica completa continua preservada em tabela_principal().
     """
@@ -560,7 +573,7 @@ def tabela_radar_w1(resultados):
 
     visual = pd.DataFrame(index=base.index)
     visual["Ativo"] = base["Ativo"]
-    visual["Preço"] = pd.to_numeric(base["Preço"], errors="coerce")
+    visual["Preço"] = pd.to_numeric(base["Preço atual"], errors="coerce")
 
     mapa = (
         ("30D — Mensal", "30D"),
@@ -572,7 +585,7 @@ def tabela_radar_w1(resultados):
 
     for coluna_visual, prefixo in mapa:
         conf_col = f"{prefixo} · Confluência %"
-        preco_col = f"{prefixo} · Preço→Confluência %"
+        preco_col = f"{prefixo} · Dist Preço→Zona %"
 
         conf = (
             pd.to_numeric(base[conf_col], errors="coerce")
@@ -604,20 +617,19 @@ def _css_confluencia_radar(conf, dist_preco):
     if not np.isfinite(conf):
         return "color: rgba(245,247,250,0.45);"
 
-    # Transformação monotônica apenas para intensidade visual:
-    # quanto menor a distância real exibida, mais visível fica a célula.
+    # Transformação monotônica apenas visual. Valores muito distantes perdem
+    # rapidamente o fundo verde; não há cortes, classes ou novo score.
     distancia = max(float(conf), 0.0)
     intensidade = 1.0 / (1.0 + distancia)
-    alpha = 0.10 + 0.52 * intensidade
-    peso = 800 if intensidade >= 0.50 else 650
+    alpha = 0.02 + 0.58 * intensidade
+    peso = int(round(600 + 200 * intensidade))
 
     css = (
         "background-color: rgba(46, 204, 113, "
         f"{alpha:.3f}); color: #F5F7FA; font-weight: {peso};"
     )
 
-    # Não é um novo sinal: o contorno aparece somente quando Dist Spot→Zona = 0,
-    # condição já definida pela matemática da V3 como Spot dentro do intervalo.
+    # Contorno somente quando a métrica já existente Dist Preço→Zona é zero.
     if np.isfinite(dist_preco) and np.isclose(
         dist_preco,
         0.0,
@@ -702,7 +714,7 @@ def tabela_secundaria(resultados):
         return df
 
     cols = [
-        "Ativo", "Empresa", "Preço", "Spot GEX",
+        "Ativo", "Empresa", "Preço atual", "Preço GARCH", "Spot GEX",
         "30D · Secundária", "30D · Sec %",
         "90D · Secundária", "90D · Sec %",
         "180D · Secundária", "180D · Sec %",
@@ -712,10 +724,13 @@ def tabela_secundaria(resultados):
 
 
 def grafico_niveis(ativo_res, bloco_nome):
-    """Mapa vertical de níveis com contraste explícito para o tema escuro do Streamlit."""
+    """Mapa vertical dos níveis, incluindo Preço atual, Spot GEX e Preço GARCH."""
     bloco = ativo_res["blocos"][bloco_nome]
+    preco_atual = core.numero_seguro(ativo_res.get("Preço atual"))
     spot = core.numero_seguro(ativo_res.get("Spot GEX"))
     preco_garch = core.numero_seguro(ativo_res.get("Preço GARCH"))
+    momento_preco_atual = ativo_res.get("Momento preço atual", pd.NaT)
+    fonte_preco_atual = str(ativo_res.get("Fonte preço atual", "N/D") or "N/D")
     bandas = bloco.get("bandas") or {}
     p = bloco.get("principal")
     s = bloco.get("secundaria")
@@ -728,7 +743,8 @@ def grafico_niveis(ativo_res, bloco_nome):
     cor_principal = "#FFB000"
     cor_secundaria = "#B388FF"
     cor_spot = "#4CC9F0"
-    cor_preco = "#2DE2A6"
+    cor_preco_atual = "#FFFFFF"
+    cor_preco_garch = "#2DE2A6"
 
     fig = go.Figure()
     niveis_validos = []
@@ -767,10 +783,7 @@ def grafico_niveis(ativo_res, bloco_nome):
             showarrow=False,
             xanchor="right",
             yanchor="bottom",
-            font=dict(
-                color=cor_garch,
-                size=12,
-            ),
+            font=dict(color=cor_garch, size=12),
             bgcolor="rgba(14,17,23,0.88)",
             borderpad=2,
         )
@@ -782,7 +795,6 @@ def grafico_niveis(ativo_res, bloco_nome):
         principal_nivel = core.numero_seguro(p.get("Nível Wall/Região"))
         if np.isfinite(principal_nivel):
             niveis_validos.append(principal_nivel)
-
             fig.add_shape(
                 type="line",
                 xref="paper",
@@ -791,10 +803,7 @@ def grafico_niveis(ativo_res, bloco_nome):
                 x1=0.94,
                 y0=principal_nivel,
                 y1=principal_nivel,
-                line=dict(
-                    color=cor_principal,
-                    width=4,
-                ),
+                line=dict(color=cor_principal, width=4),
                 layer="above",
             )
 
@@ -802,7 +811,6 @@ def grafico_niveis(ativo_res, bloco_nome):
         secundaria_nivel = core.numero_seguro(s.get("Nível Wall/Região"))
         if np.isfinite(secundaria_nivel):
             niveis_validos.append(secundaria_nivel)
-
             fig.add_shape(
                 type="line",
                 xref="paper",
@@ -811,11 +819,7 @@ def grafico_niveis(ativo_res, bloco_nome):
                 x1=0.94,
                 y0=secundaria_nivel,
                 y1=secundaria_nivel,
-                line=dict(
-                    color=cor_secundaria,
-                    width=3,
-                    dash="dash",
-                ),
+                line=dict(color=cor_secundaria, width=3, dash="dash"),
                 layer="above",
             )
 
@@ -823,7 +827,7 @@ def grafico_niveis(ativo_res, bloco_nome):
         niveis_validos.append(spot)
         fig.add_trace(
             go.Scatter(
-                x=[0.38],
+                x=[0.30],
                 y=[spot],
                 mode="markers",
                 name="Spot GEX",
@@ -836,18 +840,42 @@ def grafico_niveis(ativo_res, bloco_nome):
             )
         )
 
+    if np.isfinite(preco_atual):
+        niveis_validos.append(preco_atual)
+        hover_atual = (
+            f"Preço atual: {fmt_num(preco_atual)}"
+            f"<br>Fonte: {fonte_preco_atual}"
+            f"<br>Momento: {fmt_momento(momento_preco_atual)}"
+            "<extra></extra>"
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=[0.50],
+                y=[preco_atual],
+                mode="markers",
+                name="Preço atual",
+                marker=dict(
+                    size=17,
+                    symbol="star",
+                    color=cor_preco_atual,
+                    line=dict(color=cor_fundo, width=2),
+                ),
+                hovertemplate=hover_atual,
+            )
+        )
+
     if np.isfinite(preco_garch):
         niveis_validos.append(preco_garch)
         fig.add_trace(
             go.Scatter(
-                x=[0.62],
+                x=[0.70],
                 y=[preco_garch],
                 mode="markers",
                 name="Preço GARCH",
                 marker=dict(
                     size=13,
                     symbol="diamond",
-                    color=cor_preco,
+                    color=cor_preco_garch,
                     line=dict(color=cor_fundo, width=2),
                 ),
                 hovertemplate=f"Preço GARCH: {fmt_num(preco_garch)}<extra></extra>",
@@ -867,7 +895,6 @@ def grafico_niveis(ativo_res, bloco_nome):
     else:
         faixa_y = None
 
-    # Quando dois níveis quase coincidem, deslocamos somente os rótulos para preservar leitura.
     amplitude_rotulos = (
         float(max(niveis_validos) - min(niveis_validos))
         if len(niveis_validos) >= 2
@@ -891,18 +918,12 @@ def grafico_niveis(ativo_res, bloco_nome):
             xref="paper",
             y=principal_nivel,
             yref="y",
-            text=(
-                f"Principal {p['Wall/Região GEX']} · "
-                f"{fmt_num(principal_nivel)}"
-            ),
+            text=f"Principal {p['Wall/Região GEX']} · {fmt_num(principal_nivel)}",
             showarrow=False,
             xanchor="left",
             yanchor="middle",
             yshift=principal_shift,
-            font=dict(
-                color=cor_principal,
-                size=12,
-            ),
+            font=dict(color=cor_principal, size=12),
             bgcolor="rgba(14,17,23,0.92)",
             bordercolor=cor_principal,
             borderwidth=1,
@@ -915,60 +936,51 @@ def grafico_niveis(ativo_res, bloco_nome):
             xref="paper",
             y=secundaria_nivel,
             yref="y",
-            text=(
-                f"Secundária {s['Wall/Região GEX']} · "
-                f"{fmt_num(secundaria_nivel)}"
-            ),
+            text=f"Secundária {s['Wall/Região GEX']} · {fmt_num(secundaria_nivel)}",
             showarrow=False,
             xanchor="left",
             yanchor="middle",
             yshift=secundaria_shift,
-            font=dict(
-                color=cor_secundaria,
-                size=12,
-            ),
+            font=dict(color=cor_secundaria, size=12),
             bgcolor="rgba(14,17,23,0.92)",
             bordercolor=cor_secundaria,
             borderwidth=1,
             borderpad=3,
         )
 
-    spot_shift = 18
-    preco_shift = 18
-    if (
-        np.isfinite(spot)
-        and np.isfinite(preco_garch)
-        and abs(spot - preco_garch) <= limiar_proximidade
-    ):
-        spot_shift = 20
-        preco_shift = -22
-
+    # X distintos reduzem sobreposição mesmo quando os três preços são muito próximos.
     if np.isfinite(spot):
         fig.add_annotation(
-            x=0.38,
+            x=0.30,
             y=spot,
             text=f"Spot GEX · {fmt_num(spot)}",
             showarrow=False,
-            yshift=spot_shift,
-            font=dict(
-                color=cor_spot,
-                size=12,
-            ),
+            yshift=-20,
+            font=dict(color=cor_spot, size=12),
+            bgcolor="rgba(14,17,23,0.88)",
+            borderpad=2,
+        )
+
+    if np.isfinite(preco_atual):
+        fig.add_annotation(
+            x=0.50,
+            y=preco_atual,
+            text=f"Preço atual · {fmt_num(preco_atual)}",
+            showarrow=False,
+            yshift=24,
+            font=dict(color=cor_preco_atual, size=12),
             bgcolor="rgba(14,17,23,0.88)",
             borderpad=2,
         )
 
     if np.isfinite(preco_garch):
         fig.add_annotation(
-            x=0.62,
+            x=0.70,
             y=preco_garch,
             text=f"Preço GARCH · {fmt_num(preco_garch)}",
             showarrow=False,
-            yshift=preco_shift,
-            font=dict(
-                color=cor_preco,
-                size=12,
-            ),
+            yshift=-20,
+            font=dict(color=cor_preco_garch, size=12),
             bgcolor="rgba(14,17,23,0.88)",
             borderpad=2,
         )
@@ -985,39 +997,23 @@ def grafico_niveis(ativo_res, bloco_nome):
         gridcolor=cor_grid,
         gridwidth=1,
         zeroline=False,
-        tickfont=dict(
-            color=cor_texto,
-            size=12,
-        ),
-        title_font=dict(
-            color=cor_texto,
-            size=13,
-        ),
+        tickfont=dict(color=cor_texto, size=12),
+        title_font=dict(color=cor_texto, size=13),
         automargin=True,
     )
 
     fig.update_layout(
         title=dict(
             text=f"{ativo_res['Ativo']} — {bloco_nome}",
-            font=dict(
-                color=cor_texto,
-                size=18,
-            ),
+            font=dict(color=cor_texto, size=18),
             x=0.01,
             xanchor="left",
         ),
         height=540,
-        margin=dict(
-            l=60,
-            r=28,
-            t=65,
-            b=25,
-        ),
+        margin=dict(l=60, r=28, t=65, b=25),
         paper_bgcolor=cor_fundo,
         plot_bgcolor=cor_fundo,
-        font=dict(
-            color=cor_texto,
-        ),
+        font=dict(color=cor_texto),
         showlegend=False,
         hovermode="closest",
     )
@@ -1040,8 +1036,8 @@ def render_item(titulo, item):
     )
 
     c2.metric(
-        "Distância do preço à confluência",
-        fmt_pct(item["Dist Spot→Zona %"], 3),
+        "Distância do preço atual à zona",
+        fmt_pct(item.get("Dist Preço→Zona %"), 3),
     )
 
     c3.metric(
@@ -1060,9 +1056,10 @@ def render_item(titulo, item):
 <b>{item['Banda GARCH']}</b> em <b>{fmt_num(item['Nível banda'])}</b>
 &nbsp; × &nbsp;
 <b>{item['Wall/Região GEX']}</b> em <b>{fmt_num(item['Nível Wall/Região'])}</b><br>
-Zona: <b>{fmt_num(item['Zona inferior'])}</b> a <b>{fmt_num(item['Zona superior'])}</b>
+Preço atual: <b>{fmt_num(item.get('Preço atual'))}</b>
+&nbsp; | &nbsp; Zona: <b>{fmt_num(item['Zona inferior'])}</b> a <b>{fmt_num(item['Zona superior'])}</b>
 &nbsp; | &nbsp; Centro: <b>{fmt_num(item['Centro da zona'])}</b>
-&nbsp; | &nbsp; {item['Posição da zona vs Spot']}
+&nbsp; | &nbsp; {item.get('Posição da zona vs Preço', 'SEM DADOS')}
 </div>
 """,
         unsafe_allow_html=True,
@@ -1159,6 +1156,9 @@ if erros_worker:
         f"{len(erros_worker)} ativo(s) tiveram erro parcial na última atualização. "
         "Os demais resultados válidos foram preservados."
     )
+    with st.expander("Ver erro(s) parcial(is) da última atualização", expanded=False):
+        for ativo_erro, mensagem_erro in erros_worker.items():
+            st.code(f"{ativo_erro}: {mensagem_erro}", language="text")
 
 
 # ======================================================================================
@@ -1179,11 +1179,11 @@ with tab1:
     st.subheader("Radar W1 — visão rápida")
 
     st.caption(
-        "Cada horizonte mostra somente duas métricas já existentes: "
-        "Conf = distância entre a Banda GARCH e a W1; quanto menor, mais coincidentes estão os níveis. "
-        "Preço = distância do Spot GEX até a zona formada por Banda e W1. "
-        "🎯 PREÇO NA ZONA aparece somente quando essa distância é 0. "
-        "O fundo verde é intensidade visual contínua da própria Conf %, sem criar faixas Forte/Moderada/Fraca."
+        "Cada horizonte mostra duas métricas: "
+        "Conf = distância entre Banda GARCH e W1, mantendo o Spot GEX como denominador da regra V3; "
+        "Dist. zona = distância do Preço atual independente até a zona formada por Banda e W1. "
+        "🎯 NA ZONA aparece somente quando o Preço atual está dentro desse intervalo. "
+        "O fundo verde é apenas intensidade visual contínua da própria Conf %, sem faixas Forte/Moderada/Fraca."
     )
 
     dataframe_radar_w1(resultados)
@@ -1206,7 +1206,7 @@ with tab1:
     ):
         st.caption(
             "Preserva Banda/Dist/Status do GARCH puro, W1 escolhida, Confluência %, "
-            "Preço→Confluência %, Qualidade e todos os horizontes 30D/90D/180D."
+            "Distância Preço atual→Zona, Qualidade e todos os horizontes 30D/90D/180D."
         )
         dataframe_display(
             tabela_principal(resultados)
@@ -1245,7 +1245,7 @@ with tab2:
             "Wall/Região GEX",
             "Rank Wall",
             "Diferença Wall↔Banda %",
-            "Dist Spot→Zona %",
+            "Dist Preço→Zona %",
             "Participação Wall %",
             "Participação Call %",
             "Participação Put %",
@@ -1290,20 +1290,18 @@ with tab3:
     c1, c2, c3, c4 = st.columns(4)
 
     c1.metric(
-        "Preço GARCH",
-        fmt_num(ativo_res["Preço GARCH"]),
+        "Preço atual",
+        fmt_num(ativo_res.get("Preço atual")),
     )
 
     c2.metric(
         "Spot GEX",
-        fmt_num(ativo_res["Spot GEX"]),
+        fmt_num(ativo_res.get("Spot GEX")),
     )
 
     c3.metric(
-        "Dif. preço GARCH × Spot",
-        fmt_pct(
-            ativo_res["Preço GARCH × Spot GEX · Dif %"]
-        ),
+        "Preço GARCH",
+        fmt_num(ativo_res.get("Preço GARCH")),
     )
 
     c4.metric(
@@ -1313,35 +1311,39 @@ with tab3:
         ).strftime("%d/%m/%Y"),
     )
 
+    st.caption(
+        f"Preço atual: {ativo_res.get('Fonte preço atual', 'N/D')} • "
+        f"momento {fmt_momento(ativo_res.get('Momento preço atual'))} • "
+        f"Dif. Preço GARCH × Spot GEX: "
+        f"{fmt_pct(ativo_res.get('Preço GARCH × Spot GEX · Dif %'))}. "
+        "Preço atual, Spot GEX e Preço GARCH são referências separadas."
+    )
+
+    st.markdown("#### Período exibido no gráfico e nos detalhes")
+    st.caption(
+        "Troque aqui entre Mensal × 30D, Semestral × 90D e Semestral × 180D. "
+        "O mapa, Principal W1, Secundária W2/W3 e a tabela de combinações abaixo mudam juntos."
+    )
+
     bloco_nome = st.radio(
-        "Bloco",
+        "Período / bloco",
         [
             "Mensal × 30D",
             "Semestral × 90D",
             "Semestral × 180D",
         ],
         horizontal=True,
+        key="bloco_detalhe_periodo",
     )
 
     bloco = ativo_res["blocos"][bloco_nome]
 
-    render_item(
-        "Principal W1",
-        bloco.get("principal"),
-    )
-
-    st.markdown("---")
-
-    render_item(
-        "Secundária W2/W3",
-        bloco.get("secundaria"),
-    )
-
     st.markdown("#### Mapa de níveis")
     st.caption(
-        "O gráfico mostra as quatro bandas GARCH do período, Principal W1, Secundária W2/W3, "
-        "Spot GEX e Preço GARCH. A banda usada na confluência é a que ficou mais próxima da Wall/Região, "
-        "não necessariamente a banda GARCH mais próxima do preço."
+        "O gráfico mostra as quatro bandas GARCH do período escolhido, Principal W1, "
+        "Secundária W2/W3, Preço atual, Spot GEX e Preço GARCH. "
+        "O Preço atual é a referência usada para medir a distância até a zona. "
+        "A banda usada na confluência continua sendo a que ficou mais próxima da Wall/Região."
     )
 
     st.plotly_chart(
@@ -1354,6 +1356,18 @@ with tab3:
             "displayModeBar": False,
             "responsive": True,
         },
+    )
+
+    render_item(
+        "Principal W1",
+        bloco.get("principal"),
+    )
+
+    st.markdown("---")
+
+    render_item(
+        "Secundária W2/W3",
+        bloco.get("secundaria"),
     )
 
     todas = pd.DataFrame(
@@ -1374,15 +1388,18 @@ with tab3:
 
         cols = [
             "Camada",
+            "Preço atual",
+            "Preço GARCH",
+            "Spot GEX",
             "Banda GARCH",
             "Nível banda",
             "Wall/Região GEX",
             "Rank Wall",
             "Nível Wall/Região",
             "Diferença Wall↔Banda %",
-            "Dist Spot→Zona %",
-            "Dist Spot→Centro %",
-            "Posição da zona vs Spot",
+            "Dist Preço→Zona %",
+            "Dist Preço→Centro %",
+            "Posição da zona vs Preço",
             "Participação Wall %",
             "Participação Call %",
             "Participação Put %",
@@ -1434,7 +1451,6 @@ with tab3:
             "SEM DADOS no GARCH Anual."
         )
 
-
 with tab4:
     st.subheader(
         "Como funciona — metodologia preservada da V3"
@@ -1444,7 +1460,7 @@ with tab4:
         """
 ### O que cada aba mostra
 
-- **Radar W1:** triagem principal. Mostra somente Ativo, Preço e os três horizontes de confluência com a Wall principal W1.
+- **Radar W1:** triagem principal. Mostra Ativo, Preço atual e os três horizontes de confluência com a Wall principal W1.
 - **Walls W2/W3:** contexto secundário. Mostra as Walls de rank 2 e 3, que não substituem a W1.
 - **Detalhar ativo:** investigação de um ativo, com Principal W1, Secundária W2/W3, mapa de níveis e todas as combinações do bloco.
 - **Como funciona:** regras, metodologia e diagnóstico da atualização.
@@ -1461,7 +1477,10 @@ with tab4:
 - **GARCH Anual:** permanece sem contraparte GEX.
 - **GEX 60D:** não participa deste painel conjunto.
 - **Confluência GARCH × GEX (%):** `|Wall/Região GEX − Banda GARCH| / Spot GEX × 100`.
-- **Distância do preço à confluência:** distância do Spot GEX até o intervalo entre a Banda e a Wall/Região. Se o spot estiver dentro do intervalo, é zero.
+- **Preço atual:** cotação independente do mercado, usada somente para posição/distância até a zona e para exibição.
+- **Spot GEX:** permanece referência interna do GEX e denominador da Confluência %.
+- **Preço GARCH:** permanece referência da leitura Banda/Distância/Status do GARCH.
+- **Distância do preço atual à zona:** usa uma cotação de mercado independente, capturada na atualização do painel. É a distância desse Preço atual até o intervalo entre Banda e Wall/Região; se o Preço atual estiver dentro do intervalo, é zero. Spot GEX e Preço GARCH não são usados como substitutos.
 - Call/Put do mesmo rank só são agrupadas usando a tolerância original do GEX.
 - Participações e Gross Gamma de Call/Put compartilhadas **não são somados artificialmente**.
 - Não há score composto, nem limiar Forte/Moderada/Fraca, nem sinal de compra/venda.
@@ -1470,8 +1489,8 @@ with tab4:
 
     st.info(
         "A Confluência GARCH × GEX mede quão próximos os dois níveis estão. "
-        "A Distância do preço à confluência mede apenas onde o mercado está "
-        "em relação àquela região."
+        "A Distância do preço atual à zona mede onde a cotação independente do mercado está "
+        "em relação àquela região. Spot GEX e Preço GARCH permanecem referências próprias dos seus motores."
     )
 
     st.markdown(
