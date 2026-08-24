@@ -9,6 +9,7 @@ import pickle
 import subprocess
 import sys
 import zipfile
+from collections import deque
 from pathlib import Path
 
 import numpy as np
@@ -65,9 +66,16 @@ def sha256_file(path: Path) -> str:
 
 
 def current_core_hashes() -> dict[str, str]:
+    # O worker também participa da construção do payload/cache. Incluí-lo aqui
+    # evita aceitar um cache produzido por uma versão incompatível do worker.
     return {
         nome: sha256_file(MODULE_DIR / nome)
-        for nome in ("gex_core.py", "garch_core.py", "confluence_core.py")
+        for nome in (
+            "gex_core.py",
+            "garch_core.py",
+            "confluence_core.py",
+            "panel_worker.py",
+        )
     }
 
 
@@ -103,7 +111,8 @@ def carregar_cache():
 
 
 def ultimas_linhas(linhas, n=16):
-    return "\n".join(linhas[-n:])
+    seq = list(linhas)
+    return "\n".join(seq[-n:])
 
 
 def executar_worker(force_gex: bool):
@@ -139,7 +148,9 @@ def executar_worker(force_gex: bool):
     )
 
     log_box = st.empty()
-    linhas = []
+    # Mantém somente uma janela recente na memória. O histórico completo continua
+    # disponível nos Cloud Logs porque cada linha também é reimpressa no stdout.
+    linhas = deque(maxlen=400)
 
     try:
         process = subprocess.Popen(
@@ -162,6 +173,9 @@ def executar_worker(force_gex: bool):
         if not line:
             continue
         linhas.append(line)
+        # O subprocesso é capturado para a interface; sem este print, as linhas
+        # do worker desaparecem do Cloud Log justamente se o app for encerrado.
+        print(line, flush=True)
         log_box.code(
             ultimas_linhas(linhas),
             language="text",
@@ -246,7 +260,7 @@ col_title, col_btn = st.columns([7, 1])
 with col_title:
     st.title("GARCH × GEX — CONFLUÊNCIA V3")
     st.markdown(
-        '<div class="v3-sub">Principal W1 • Secundária W2/W3 • Mensal×30D • Semestral×90D • Semestral×180D • GARCH Mensal/Semestral/Anual</div>',
+        '<div class="v3-sub">Radar W1 • Walls W2/W3 • Mensal×30D • Semestral×90D • Semestral×180D • GARCH Mensal/Semestral/Anual</div>',
         unsafe_allow_html=True,
     )
 
@@ -381,7 +395,12 @@ def leitura_garch_puro(ativo_res, periodo):
             preco,
             bandas,
         )
-    except Exception:
+    except Exception as exc:
+        print(
+            f"[V3 APP] Falha ao ler GARCH puro {periodo}: "
+            f"{type(exc).__name__}: {exc}",
+            flush=True,
+        )
         return {
             "banda": "SEM DADOS",
             "dist_pct": np.nan,
@@ -446,6 +465,234 @@ def tabela_principal(resultados):
     ]
 
     return df[[c for c in cols if c in df.columns]]
+
+
+def _texto_garch_resumido(leitura):
+    """Resume a leitura do GARCH puro para uma célula compacta, sem mudar a regra original."""
+    if not leitura:
+        return "N/D"
+
+    status = str(leitura.get("status", "SEM DADOS") or "SEM DADOS")
+    banda = str(leitura.get("banda", "SEM DADOS") or "SEM DADOS")
+    dist = core.numero_seguro(leitura.get("dist_pct"))
+
+    if status == "SEM DADOS" or banda == "SEM DADOS":
+        return "N/D"
+
+    dist_txt = fmt_pct(dist) if np.isfinite(dist) else "—"
+
+    # O status NORMAL não traz a banda no próprio texto; nos demais estados
+    # (PRÓXIMO/ACIMA/ABAIXO), o status original já identifica a região.
+    if "NORMAL" in status.upper():
+        return f"{status} · banda {banda} · {dist_txt}"
+
+    return f"{status} · {dist_txt}"
+
+
+def tabela_garch_puro(resultados):
+    """Visão separada do GARCH puro Mensal/Semestral/Anual.
+
+    Essa tabela não participa da confluência. Ela apenas reapresenta a leitura
+    original Banda/Distância/Status já calculada para cada ativo.
+    """
+    rows = []
+    ordem = core.dataframe_radar(resultados)
+    ativos_ordenados = (
+        ordem["Ativo"].tolist()
+        if not ordem.empty and "Ativo" in ordem.columns
+        else list(resultados.keys())
+    )
+
+    for ativo in ativos_ordenados:
+        ativo_res = resultados[ativo]
+        rows.append(
+            {
+                "Ativo": ativo,
+                "Preço": core.numero_seguro(ativo_res.get("Preço GARCH")),
+                "Mensal": _texto_garch_resumido(
+                    leitura_garch_puro(ativo_res, "MENSAL")
+                ),
+                "Semestral": _texto_garch_resumido(
+                    leitura_garch_puro(ativo_res, "SEMESTRAL")
+                ),
+                "Anual": _texto_garch_resumido(
+                    leitura_garch_puro(ativo_res, "ANUAL")
+                ),
+            }
+        )
+
+    return pd.DataFrame(rows)
+
+
+def _texto_confluencia_radar(conf_pct, dist_preco_pct):
+    """Texto operacional de uma célula do Radar W1.
+
+    Conf = distância Banda GARCH ↔ W1.
+    Preço = distância do Spot GEX até a zona entre Banda e W1.
+    O alvo aparece somente quando a própria métrica existente é zero,
+    isto é, quando o Spot está dentro da zona.
+    """
+    conf = core.numero_seguro(conf_pct)
+    dist_preco = core.numero_seguro(dist_preco_pct)
+
+    if not np.isfinite(conf):
+        return "N/D"
+
+    conf_txt = fmt_pct(conf)
+
+    if np.isfinite(dist_preco):
+        if np.isclose(dist_preco, 0.0, atol=1e-12, rtol=0.0):
+            return f"Conf {conf_txt} · 🎯 PREÇO NA ZONA"
+        return f"Conf {conf_txt} · Preço {fmt_pct(dist_preco)}"
+
+    return f"Conf {conf_txt} · Preço N/D"
+
+
+def tabela_radar_w1(resultados):
+    """Radar operacional enxuto: Ativo, Preço e os três horizontes W1.
+
+    A tabela técnica completa continua preservada em tabela_principal().
+    """
+    base = core.dataframe_radar(resultados)
+
+    if base.empty:
+        return base, base
+
+    visual = pd.DataFrame(index=base.index)
+    visual["Ativo"] = base["Ativo"]
+    visual["Preço"] = pd.to_numeric(base["Preço"], errors="coerce")
+
+    mapa = (
+        ("30D — Mensal", "30D"),
+        ("90D — Semestral", "90D"),
+        ("180D — Semestral", "180D"),
+    )
+
+    metricas = pd.DataFrame(index=base.index)
+
+    for coluna_visual, prefixo in mapa:
+        conf_col = f"{prefixo} · Confluência %"
+        preco_col = f"{prefixo} · Preço→Confluência %"
+
+        conf = (
+            pd.to_numeric(base[conf_col], errors="coerce")
+            if conf_col in base.columns
+            else pd.Series(np.nan, index=base.index, dtype=float)
+        )
+        dist_preco = (
+            pd.to_numeric(base[preco_col], errors="coerce")
+            if preco_col in base.columns
+            else pd.Series(np.nan, index=base.index, dtype=float)
+        )
+
+        visual[coluna_visual] = [
+            _texto_confluencia_radar(c, d)
+            for c, d in zip(conf, dist_preco)
+        ]
+
+        metricas[f"{coluna_visual} · conf"] = conf
+        metricas[f"{coluna_visual} · preco"] = dist_preco
+
+    return visual, metricas
+
+
+def _css_confluencia_radar(conf, dist_preco):
+    """Destaque exclusivamente visual e contínuo, sem criar faixas de classificação."""
+    conf = core.numero_seguro(conf)
+    dist_preco = core.numero_seguro(dist_preco)
+
+    if not np.isfinite(conf):
+        return "color: rgba(245,247,250,0.45);"
+
+    # Transformação monotônica apenas para intensidade visual:
+    # quanto menor a distância real exibida, mais visível fica a célula.
+    distancia = max(float(conf), 0.0)
+    intensidade = 1.0 / (1.0 + distancia)
+    alpha = 0.10 + 0.52 * intensidade
+    peso = 800 if intensidade >= 0.50 else 650
+
+    css = (
+        "background-color: rgba(46, 204, 113, "
+        f"{alpha:.3f}); color: #F5F7FA; font-weight: {peso};"
+    )
+
+    # Não é um novo sinal: o contorno aparece somente quando Dist Spot→Zona = 0,
+    # condição já definida pela matemática da V3 como Spot dentro do intervalo.
+    if np.isfinite(dist_preco) and np.isclose(
+        dist_preco,
+        0.0,
+        atol=1e-12,
+        rtol=0.0,
+    ):
+        css += " box-shadow: inset 0 0 0 2px rgba(247,201,72,0.95);"
+
+    return css
+
+
+def dataframe_radar_w1(resultados):
+    """Renderiza a visão rápida W1 sem poluir a tela com colunas técnicas."""
+    visual, metricas = tabela_radar_w1(resultados)
+
+    if visual.empty:
+        st.dataframe(
+            visual,
+            use_container_width=True,
+            hide_index=True,
+        )
+        return
+
+    estilos = pd.DataFrame(
+        "",
+        index=visual.index,
+        columns=visual.columns,
+    )
+
+    for coluna in ("30D — Mensal", "90D — Semestral", "180D — Semestral"):
+        conf = metricas[f"{coluna} · conf"]
+        dist_preco = metricas[f"{coluna} · preco"]
+
+        estilos[coluna] = [
+            _css_confluencia_radar(c, d)
+            for c, d in zip(conf, dist_preco)
+        ]
+
+    styler = visual.style.apply(
+        lambda _df: estilos,
+        axis=None,
+    )
+
+    st.dataframe(
+        styler,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "Ativo": st.column_config.TextColumn(
+                "Ativo",
+                width="small",
+            ),
+            "Preço": st.column_config.NumberColumn(
+                "Preço",
+                format="%.2f",
+                width="small",
+            ),
+            "30D — Mensal": st.column_config.TextColumn(
+                "30D — Mensal",
+                width="large",
+                help="GARCH Mensal × W1 do GEX 30D.",
+            ),
+            "90D — Semestral": st.column_config.TextColumn(
+                "90D — Semestral",
+                width="large",
+                help="GARCH Semestral × W1 do GEX 90D.",
+            ),
+            "180D — Semestral": st.column_config.TextColumn(
+                "180D — Semestral",
+                width="large",
+                help="GARCH Semestral × W1 do GEX 180D.",
+            ),
+        },
+        height=min(820, 38 * (len(visual) + 1)),
+    )
 
 
 def tabela_secundaria(resultados):
@@ -920,27 +1167,50 @@ if erros_worker:
 
 tab1, tab2, tab3, tab4 = st.tabs(
     [
-        "Radar Principal W1",
-        "Secundária W2/W3",
-        "Detalhes por ativo",
-        "Metodologia",
+        "Radar W1",
+        "Walls W2/W3",
+        "Detalhar ativo",
+        "Como funciona",
     ]
 )
 
 
 with tab1:
-    st.subheader("Confluência Principal — W1")
+    st.subheader("Radar W1 — visão rápida")
 
     st.caption(
-        "Ordenação relativa: menor confluência principal disponível primeiro. "
-        "Mensal/Semestral/Anual · Banda/Dist/Status = leitura do GARCH puro pelo Preço GARCH. "
-        "30D/90D/180D · Principal = banda GARCH escolhida pela proximidade com a W1; "
-        "as duas bandas podem ser diferentes. Ainda não há classificação Forte/Moderada/Fraca."
+        "Cada horizonte mostra somente duas métricas já existentes: "
+        "Conf = distância entre a Banda GARCH e a W1; quanto menor, mais coincidentes estão os níveis. "
+        "Preço = distância do Spot GEX até a zona formada por Banda e W1. "
+        "🎯 PREÇO NA ZONA aparece somente quando essa distância é 0. "
+        "O fundo verde é intensidade visual contínua da própria Conf %, sem criar faixas Forte/Moderada/Fraca."
     )
 
-    dataframe_display(
-        tabela_principal(resultados)
-    )
+    dataframe_radar_w1(resultados)
+
+    with st.expander(
+        "Ver GARCH puro — Mensal / Semestral / Anual",
+        expanded=False,
+    ):
+        st.caption(
+            "Esta leitura é somente do GARCH em relação ao Preço GARCH. "
+            "Ela não mede confluência com GEX e pode apontar uma banda diferente da banda usada na confluência."
+        )
+        dataframe_display(
+            tabela_garch_puro(resultados)
+        )
+
+    with st.expander(
+        "Ver tabela técnica completa do Radar W1",
+        expanded=False,
+    ):
+        st.caption(
+            "Preserva Banda/Dist/Status do GARCH puro, W1 escolhida, Confluência %, "
+            "Preço→Confluência %, Qualidade e todos os horizontes 30D/90D/180D."
+        )
+        dataframe_display(
+            tabela_principal(resultados)
+        )
 
     st.download_button(
         "Baixar CSVs do painel V3",
@@ -951,7 +1221,7 @@ with tab1:
 
 
 with tab2:
-    st.subheader("Confluência Secundária — W2/W3")
+    st.subheader("Walls secundárias — W2/W3")
 
     st.caption(
         "W2/W3 permanecem separadas da W1 e não substituem a confluência principal."
@@ -998,7 +1268,7 @@ with tab2:
 
 
 with tab3:
-    st.subheader("Detalhes por ativo")
+    st.subheader("Detalhar ativo")
 
     ativos_lista = list(resultados.keys())
     default_idx = 0
@@ -1167,11 +1437,20 @@ with tab3:
 
 with tab4:
     st.subheader(
-        "Metodologia preservada da V3"
+        "Como funciona — metodologia preservada da V3"
     )
 
     st.markdown(
         """
+### O que cada aba mostra
+
+- **Radar W1:** triagem principal. Mostra somente Ativo, Preço e os três horizontes de confluência com a Wall principal W1.
+- **Walls W2/W3:** contexto secundário. Mostra as Walls de rank 2 e 3, que não substituem a W1.
+- **Detalhar ativo:** investigação de um ativo, com Principal W1, Secundária W2/W3, mapa de níveis e todas as combinações do bloco.
+- **Como funciona:** regras, metodologia e diagnóstico da atualização.
+
+### Regras preservadas
+
 - **Principal:** somente Call/Put W1.
 - **Secundária:** somente W2/W3.
 - **Mensal GARCH × GEX 30D**.
