@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 import math
+import time
 import warnings
 from datetime import datetime
 from typing import Any
@@ -68,29 +69,107 @@ def normalizar_timestamp(ts: Any) -> pd.Timestamp:
     return ts
 
 def baixar_historico_diario(codigo: str) -> pd.DataFrame:
+    """Baixa o mesmo histórico diário usado pelo GARCH com redundância no Yahoo.
+
+    A mudança é somente de robustez da coleta. Permanecem iguais:
+    histórico de 10 anos, intervalo diário, auto_adjust=False, OHLC obrigatório
+    e mínimo de observações. Nenhuma fórmula ou parâmetro do GARCH é alterado.
+    """
     ticker = ticker_yahoo(codigo)
-    df = yf.download(ticker, period=f'{HISTORICO_ANOS}y', interval='1d', auto_adjust=False, actions=False, progress=False, threads=False)
-    df = achatar_colunas(df)
-    if df.empty:
-        raise ValueError(f'Yahoo Finance não retornou histórico diário para {ticker}.')
     obrigatorias = ['Open', 'High', 'Low', 'Close']
-    faltando = [coluna for coluna in obrigatorias if coluna not in df.columns]
-    if faltando:
-        raise ValueError(f'Colunas ausentes em {ticker}: {faltando}')
-    colunas = obrigatorias.copy()
-    if 'Adj Close' in df.columns:
-        colunas.append('Adj Close')
-    df = df[colunas].copy()
-    indice = pd.to_datetime(df.index)
-    try:
-        indice = indice.tz_localize(None)
-    except TypeError:
-        pass
-    df.index = indice
-    df = df.dropna(subset=obrigatorias).sort_index()
-    if len(df) < MIN_OBSERVACOES:
-        raise ValueError(f'Histórico insuficiente para {codigo}: {len(df)} observações.')
-    return df
+    agora = agora_local().normalize()
+    inicio = (agora - pd.DateOffset(years=HISTORICO_ANOS)).strftime('%Y-%m-%d')
+    fim = (agora + pd.Timedelta(days=1)).strftime('%Y-%m-%d')
+
+    def validar(df: pd.DataFrame, origem: str) -> pd.DataFrame:
+        df = achatar_colunas(df)
+
+        if df.empty:
+            raise ValueError(f'{origem}: histórico vazio.')
+
+        faltando = [coluna for coluna in obrigatorias if coluna not in df.columns]
+        if faltando:
+            raise ValueError(f'{origem}: colunas ausentes {faltando}.')
+
+        colunas = obrigatorias.copy()
+        if 'Adj Close' in df.columns:
+            colunas.append('Adj Close')
+
+        df = df[colunas].copy()
+        indice = pd.to_datetime(df.index)
+
+        try:
+            indice = indice.tz_localize(None)
+        except TypeError:
+            pass
+
+        df.index = indice
+        df = df.dropna(subset=obrigatorias).sort_index()
+
+        if len(df) < MIN_OBSERVACOES:
+            raise ValueError(
+                f'{origem}: histórico insuficiente para {codigo}: '
+                f'{len(df)} observações.'
+            )
+
+        return df
+
+    def download_periodo() -> pd.DataFrame:
+        return yf.download(
+            ticker,
+            period=f'{HISTORICO_ANOS}y',
+            interval='1d',
+            auto_adjust=False,
+            actions=False,
+            progress=False,
+            threads=False,
+        )
+
+    def ticker_history() -> pd.DataFrame:
+        return yf.Ticker(ticker).history(
+            period=f'{HISTORICO_ANOS}y',
+            interval='1d',
+            auto_adjust=False,
+            actions=False,
+        )
+
+    def download_datas() -> pd.DataFrame:
+        return yf.download(
+            ticker,
+            start=inicio,
+            end=fim,
+            interval='1d',
+            auto_adjust=False,
+            actions=False,
+            progress=False,
+            threads=False,
+        )
+
+    tentativas = [
+        ('yf.download período', download_periodo),
+        ('yf.download período retry', download_periodo),
+        ('Ticker.history período', ticker_history),
+        ('yf.download datas', download_datas),
+    ]
+
+    erros = []
+
+    for numero, (origem, carregar) in enumerate(tentativas, start=1):
+        try:
+            return validar(carregar(), origem)
+        except Exception as exc:
+            erros.append(
+                f'{numero}/{len(tentativas)} {origem}: '
+                f'{type(exc).__name__}: {exc}'
+            )
+            if numero < len(tentativas):
+                time.sleep(1.0)
+
+    raise ValueError(
+        f'Yahoo Finance não retornou histórico diário válido para {ticker} '
+        f'após {len(tentativas)} tentativas. '
+        + ' | '.join(erros)
+    )
 
 def baixar_preco_mais_recente(codigo: str, historico: pd.DataFrame) -> tuple[float, str, pd.Timestamp]:
     ticker = ticker_yahoo(codigo)
