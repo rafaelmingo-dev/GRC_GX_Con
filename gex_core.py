@@ -1072,16 +1072,48 @@ def child_text(
     return None
 
 
+
+def process_memory_mb():
+    """Retorna (RSS atual, pico/HWM) em MB no Linux; NaN fora dele.
+
+    É somente observabilidade. Não participa de nenhum cálculo financeiro.
+    """
+    current = np.nan
+    peak = np.nan
+
+    try:
+        with open("/proc/self/status", "r", encoding="utf-8") as status_file:
+            for line in status_file:
+                if line.startswith("VmRSS:"):
+                    current = float(line.split()[1]) / 1024.0
+                elif line.startswith("VmHWM:"):
+                    peak = float(line.split()[1]) / 1024.0
+    except Exception:
+        pass
+
+    return current, peak
+
+
+def memory_text():
+    current, peak = process_memory_mb()
+    current_txt = f"{current:.1f} MB" if np.isfinite(current) else "N/D"
+    peak_txt = f"{peak:.1f} MB" if np.isfinite(peak) else "N/D"
+    return f"RAM atual={current_txt} | pico={peak_txt}"
+
 def parse_instruments(path):
-    """Lê BVBG.028.02 e mapeia opções ao ativo-objeto com uso de memória reduzido.
+    """Lê BVBG.028.02 e mapeia opções ao ativo-objeto com memória reduzida.
 
     A matemática não muda. A otimização é apenas de ingestão:
-    1) primeira passagem cria um mapa compacto instrument_id -> ticker;
-    2) segunda passagem guarda somente opções cujo ativo-objeto pertence a ATIVOS_PILOTO.
+    1) primeira passagem guarda somente IDs dos ativos-objeto monitorados;
+    2) segunda passagem guarda somente opções ligadas a esses ativos;
+    3) registros temporários usam tuplas em vez de dicionários por linha.
     """
     ns = "{urn:bvmf.100.02.xsd}"
     started = time.time()
+    monitored_assets = set(ATIVOS_PILOTO)
 
+    # Só precisamos resolver IDs dos 21 ativos-objeto monitorados. Guardar o mapa
+    # de todos os ~200 mil instrumentos aumentava o pico/RSS sem alterar o resultado.
     ticker_by_id = {}
     instrument_count = 0
 
@@ -1108,7 +1140,7 @@ def parse_instruments(path):
             else None
         )
 
-        if instrument_id and ticker:
+        if instrument_id and ticker in monitored_assets:
             ticker_by_id[instrument_id] = ticker
 
         element.clear()
@@ -1116,10 +1148,31 @@ def parse_instruments(path):
             del element.getparent()[0]
 
         if instrument_count % 50000 == 0:
-            print(f"    Cadastro mapa: {instrument_count:,} instrumentos...")
+            print(
+                f"    Cadastro mapa: {instrument_count:,} instrumentos; "
+                f"{len(ticker_by_id):,} underlyings monitorados | {memory_text()}"
+            )
 
     del context
 
+    option_columns = [
+        "instrument_id",
+        "symbol",
+        "isin",
+        "asset",
+        "asset_description",
+        "option_type",
+        "option_style",
+        "strike",
+        "maturity_date",
+        "trading_start_date",
+        "trading_end_date",
+        "contract_size",
+        "price_factor",
+        "underlying_id",
+        "underlying_ticker",
+        "record_type",
+    ]
     option_records = []
 
     context = etree.iterparse(
@@ -1159,20 +1212,17 @@ def parse_instruments(path):
                     option,
                     f"./{ns}UndrlygInstrmId/{ns}OthrId/{ns}Id",
                 )
-
                 underlying_ticker = ticker_by_id.get(underlying_id)
 
-                if underlying_ticker in ATIVOS_PILOTO:
+                if underlying_ticker is not None:
                     instrument_id = child_text(
                         element,
                         f"./{ns}FinInstrmId/{ns}OthrId/{ns}Id",
                     )
-
                     asset = child_text(
                         element,
                         f"./{ns}FinInstrmAttrCmon/{ns}Asst",
                     )
-
                     asset_description = child_text(
                         element,
                         f"./{ns}FinInstrmAttrCmon/{ns}AsstDesc",
@@ -1186,28 +1236,27 @@ def parse_instruments(path):
                             else None
                         )
 
+                    # Tupla mantém exatamente as mesmas colunas, reduzindo o overhead
+                    # temporário de um dict Python para cada opção.
                     option_records.append(
-                        {
-                            "instrument_id": instrument_id,
-                            "symbol": ticker,
-                            "isin": isin,
-                            "asset": asset,
-                            "asset_description": asset_description,
-                            "option_type": opt_text("OptnTp"),
-                            "option_style": (
-                                opt_text("OptnStyle")
-                                or opt_text("ExrcStyle")
-                            ),
-                            "strike": opt_text("ExrcPric"),
-                            "maturity_date": opt_text("XprtnDt"),
-                            "trading_start_date": opt_text("TradgStartDt"),
-                            "trading_end_date": opt_text("TradgEndDt"),
-                            "contract_size": opt_text("AllcnRndLot"),
-                            "price_factor": opt_text("PricFctr"),
-                            "underlying_id": underlying_id,
-                            "underlying_ticker": underlying_ticker,
-                            "record_type": record_type,
-                        }
+                        (
+                            instrument_id,
+                            ticker,
+                            isin,
+                            asset,
+                            asset_description,
+                            opt_text("OptnTp"),
+                            opt_text("OptnStyle") or opt_text("ExrcStyle"),
+                            opt_text("ExrcPric"),
+                            opt_text("XprtnDt"),
+                            opt_text("TradgStartDt"),
+                            opt_text("TradgEndDt"),
+                            opt_text("AllcnRndLot"),
+                            opt_text("PricFctr"),
+                            underlying_id,
+                            underlying_ticker,
+                            record_type,
+                        )
                     )
 
         element.clear()
@@ -1215,32 +1264,21 @@ def parse_instruments(path):
             del element.getparent()[0]
 
     del context
+    del ticker_by_id
+    gc.collect()
 
-    option_columns = [
-        "instrument_id",
-        "symbol",
-        "isin",
-        "asset",
-        "asset_description",
-        "option_type",
-        "option_style",
-        "strike",
-        "maturity_date",
-        "trading_start_date",
-        "trading_end_date",
-        "contract_size",
-        "price_factor",
-        "underlying_id",
-        "underlying_ticker",
-        "record_type",
-    ]
-
-    options = pd.DataFrame(option_records, columns=option_columns)
+    options = pd.DataFrame.from_records(
+        option_records,
+        columns=option_columns,
+    )
+    del option_records
+    gc.collect()
 
     if not options.empty:
-        options = options.drop_duplicates(
+        options.drop_duplicates(
             "instrument_id",
             keep="last",
+            inplace=True,
         )
 
         for column in ("strike", "contract_size", "price_factor"):
@@ -1259,34 +1297,88 @@ def parse_instruments(path):
                 errors="coerce",
             )
 
+        options.reset_index(drop=True, inplace=True)
+
     # O chamador usa apenas len(instruments) para metadata.
     instruments = pd.DataFrame(index=pd.RangeIndex(instrument_count))
 
     print(
         f"    Cadastro concluído: {instrument_count:,} instrumentos; "
         f"{len(options):,} opções dos ativos B3 monitorados; "
-        f"{time.time() - started:.1f}s."
+        f"{time.time() - started:.1f}s | {memory_text()}."
     )
 
-    return instruments, options.reset_index(drop=True)
+    return instruments, options
 
 
 def parse_price_report(path, relevant_instrument_ids=None):
-    """Lê BVBG.086.01 PriceReport com filtro opcional de IDs relevantes.
+    """Lê BVBG.086.01 PriceReport retendo somente IDs relevantes.
 
-    A matemática não muda. Quando relevant_instrument_ids é informado,
-    o parser retém apenas opções monitoradas e respectivos ativos-objeto.
+    A matemática e as 14 colunas retornadas são preservadas. A mudança é de
+    representação temporária: tuplas substituem dicionários por linha, o buffer
+    é liberado antes das conversões pandas e o progresso mostra RAM atual/pico.
     """
     ns = "{urn:bvmf.217.01.xsd}"
+    columns = [
+        "instrument_id",
+        "price_symbol",
+        "price_date",
+        "open_interest",
+        "best_bid",
+        "best_ask",
+        "first_price",
+        "minimum_price",
+        "maximum_price",
+        "average_price",
+        "last_price",
+        "trade_count",
+        "traded_quantity",
+        "financial_volume",
+    ]
+    numeric_columns = [
+        "open_interest",
+        "best_bid",
+        "best_ask",
+        "first_price",
+        "minimum_price",
+        "maximum_price",
+        "average_price",
+        "last_price",
+        "trade_count",
+        "traded_quantity",
+        "financial_volume",
+    ]
+
     records = []
     started = time.time()
     count = 0
 
-    relevant = (
-        set(str(x) for x in relevant_instrument_ids if pd.notna(x))
-        if relevant_instrument_ids is not None
-        else None
-    )
+    if relevant_instrument_ids is None:
+        relevant = None
+        owns_relevant = False
+    elif (
+        isinstance(relevant_instrument_ids, set)
+        and all(isinstance(x, str) for x in relevant_instrument_ids)
+    ):
+        # run_full_pipeline já entrega exatamente um set[str]; reutilizá-lo evita
+        # manter dois sets grandes simultaneamente durante o PriceReport.
+        relevant = relevant_instrument_ids
+        owns_relevant = False
+    else:
+        relevant = {
+            str(x)
+            for x in relevant_instrument_ids
+            if pd.notna(x)
+        }
+        owns_relevant = True
+
+    def value(element, name):
+        node = element.find(f".//{ns}{name}")
+        return (
+            node.text.strip()
+            if node is not None and node.text
+            else None
+        )
 
     context = etree.iterparse(
         str(path),
@@ -1305,31 +1397,23 @@ def parse_price_report(path, relevant_instrument_ids=None):
         )
 
         if relevant is None or instrument_id in relevant:
-            def value(name):
-                node = element.find(f".//{ns}{name}")
-                return (
-                    node.text.strip()
-                    if node is not None and node.text
-                    else None
-                )
-
             records.append(
-                {
-                    "instrument_id": instrument_id,
-                    "price_symbol": value("TckrSymb"),
-                    "price_date": value("Dt"),
-                    "open_interest": value("OpnIntrst"),
-                    "best_bid": value("BestBidPric"),
-                    "best_ask": value("BestAskPric"),
-                    "first_price": value("FrstPric"),
-                    "minimum_price": value("MinPric"),
-                    "maximum_price": value("MaxPric"),
-                    "average_price": value("TradAvrgPric"),
-                    "last_price": value("LastPric"),
-                    "trade_count": value("RglrTxsQty") or value("TradQty"),
-                    "traded_quantity": value("RglrTraddCtrcts") or value("FinInstrmQty"),
-                    "financial_volume": value("NtlRglrVol") or value("NtlFinVol"),
-                }
+                (
+                    instrument_id,
+                    value(element, "TckrSymb"),
+                    value(element, "Dt"),
+                    value(element, "OpnIntrst"),
+                    value(element, "BestBidPric"),
+                    value(element, "BestAskPric"),
+                    value(element, "FrstPric"),
+                    value(element, "MinPric"),
+                    value(element, "MaxPric"),
+                    value(element, "TradAvrgPric"),
+                    value(element, "LastPric"),
+                    value(element, "RglrTxsQty") or value(element, "TradQty"),
+                    value(element, "RglrTraddCtrcts") or value(element, "FinInstrmQty"),
+                    value(element, "NtlRglrVol") or value(element, "NtlFinVol"),
+                )
             )
 
         element.clear()
@@ -1339,43 +1423,27 @@ def parse_price_report(path, relevant_instrument_ids=None):
         if count % 20000 == 0:
             print(
                 f"    PriceReport: {count:,} registros lidos; "
-                f"{len(records):,} relevantes..."
+                f"{len(records):,} relevantes | {memory_text()}"
             )
 
     del context
+    print(
+        f"    PriceReport XML concluído: {count:,} registros; "
+        f"{len(records):,} relevantes | {memory_text()}"
+    )
 
-    columns = [
-        "instrument_id",
-        "price_symbol",
-        "price_date",
-        "open_interest",
-        "best_bid",
-        "best_ask",
-        "first_price",
-        "minimum_price",
-        "maximum_price",
-        "average_price",
-        "last_price",
-        "trade_count",
-        "traded_quantity",
-        "financial_volume",
-    ]
+    prices = pd.DataFrame.from_records(
+        records,
+        columns=columns,
+    )
+    del records
+    if owns_relevant:
+        del relevant
+    gc.collect()
 
-    prices = pd.DataFrame(records, columns=columns)
-
-    numeric_columns = [
-        "open_interest",
-        "best_bid",
-        "best_ask",
-        "first_price",
-        "minimum_price",
-        "maximum_price",
-        "average_price",
-        "last_price",
-        "trade_count",
-        "traded_quantity",
-        "financial_volume",
-    ]
+    print(
+        f"    PriceReport DataFrame criado: {len(prices):,} linhas | {memory_text()}"
+    )
 
     for column in numeric_columns:
         prices[column] = pd.to_numeric(
@@ -1388,17 +1456,17 @@ def parse_price_report(path, relevant_instrument_ids=None):
         errors="coerce",
     )
 
-    prices = (
-        prices.drop_duplicates(
-            "instrument_id",
-            keep="last",
-        )
-        .reset_index(drop=True)
+    prices.drop_duplicates(
+        "instrument_id",
+        keep="last",
+        inplace=True,
     )
+    prices.reset_index(drop=True, inplace=True)
+    gc.collect()
 
     print(
         f"    PriceReport concluído: {count:,} registros lidos; "
-        f"{len(prices):,} retidos; {time.time() - started:.1f}s."
+        f"{len(prices):,} retidos; {time.time() - started:.1f}s | {memory_text()}."
     )
 
     return prices
@@ -1419,11 +1487,19 @@ def parse_reference_premium(path, relevant_symbols=None):
     if path is None or not Path(path).exists():
         return pd.DataFrame(columns=columns)
 
-    relevant = (
-        set(str(x) for x in relevant_symbols if pd.notna(x))
-        if relevant_symbols is not None
-        else None
-    )
+    if relevant_symbols is None:
+        relevant = None
+    elif (
+        isinstance(relevant_symbols, set)
+        and all(isinstance(x, str) for x in relevant_symbols)
+    ):
+        relevant = relevant_symbols
+    else:
+        relevant = {
+            str(x)
+            for x in relevant_symbols
+            if pd.notna(x)
+        }
 
     read_kwargs = dict(
         filepath_or_buffer=path,
@@ -1460,6 +1536,8 @@ def parse_reference_premium(path, relevant_symbols=None):
             if parts
             else pd.DataFrame(columns=columns)
         )
+        del parts
+        gc.collect()
 
     for column in (
         "reference_strike",
@@ -2790,16 +2868,20 @@ def run_full_pipeline(force=False):
     reference_txt = selected_content["reference_txt"]
 
     print("\nLendo Cadastro de Instrumentos...")
-    instruments, options = (
-        parse_instruments(
-            instrument_xml
-        )
+    instruments, options = parse_instruments(
+        instrument_xml
     )
+    instrument_count = int(len(instruments))
+    del instruments
+    gc.collect()
+    print(f"    Após Cadastro | {memory_text()}")
 
+    # As duas colunas já são strings vindas do XML; não criamos Series astype(str)
+    # adicionais. O mesmo set é reutilizado dentro de parse_price_report().
     relevant_price_ids = set(
-        options["instrument_id"].dropna().astype(str)
+        options["instrument_id"].dropna()
     ) | set(
-        options["underlying_id"].dropna().astype(str)
+        options["underlying_id"].dropna()
     )
 
     print("\nLendo PriceReport...")
@@ -2807,9 +2889,12 @@ def run_full_pipeline(force=False):
         price_xml,
         relevant_instrument_ids=relevant_price_ids,
     )
+    del relevant_price_ids
+    gc.collect()
+    print(f"    Após PriceReport | {memory_text()}")
 
     relevant_reference_symbols = set(
-        options["symbol"].dropna().astype(str)
+        options["symbol"].dropna()
     )
 
     print("\nLendo Prêmio de Referência...")
@@ -2817,8 +2902,10 @@ def run_full_pipeline(force=False):
         reference_txt,
         relevant_symbols=relevant_reference_symbols,
     )
+    del relevant_reference_symbols
+    gc.collect()
     print(
-        f"    Prêmios de referência retidos: {len(reference):,}."
+        f"    Prêmios de referência retidos: {len(reference):,} | {memory_text()}."
     )
 
     print("\nMontando universo utilizável...")
@@ -2828,18 +2915,17 @@ def run_full_pipeline(force=False):
         reference,
         selected_date,
     )
+    market_base_count = int(len(market_base))
 
+    # Estes objetos não participam mais da matemática depois do merge. Liberá-los
+    # antes de IV/Gamma reduz o pico acumulado do worker.
     del prices
     del reference
-    del relevant_price_ids
-    del relevant_reference_symbols
-    gc.collect()
-    print(
-        f"    Séries B3 monitoradas após filtros: {len(market_base):,}."
-    )
-
     del options
     gc.collect()
+    print(
+        f"    Séries B3 monitoradas após filtros: {market_base_count:,} | {memory_text()}."
+    )
 
     if market_base.empty:
         raise RuntimeError(
@@ -2892,12 +2978,8 @@ def run_full_pipeline(force=False):
             if reference_txt is not None
             else None
         ),
-        "instrument_count": int(
-            len(instruments)
-        ),
-        "pilot_option_count_before_math": int(
-            len(market_base)
-        ),
+        "instrument_count": instrument_count,
+        "pilot_option_count_before_math": market_base_count,
         "series_after_iv_gamma": int(
             len(result)
         ),
@@ -2930,8 +3012,11 @@ def run_full_pipeline(force=False):
 # 6) NORMALIZAÇÃO PARA O PAINEL
 # ======================================================================================
 
-def prepare_panel_data(frame):
-    frame = frame.copy()
+def prepare_panel_data(frame, copy_frame=True):
+    # O padrão True preserva o comportamento do GEX original. O worker do painel
+    # conjunto pode passar False porque possui a base e a descarta logo em seguida.
+    if copy_frame:
+        frame = frame.copy()
 
     numeric_columns = [
         "strike",
