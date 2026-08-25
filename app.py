@@ -550,49 +550,14 @@ def tabela_garch_puro(resultados):
     return pd.DataFrame(rows)
 
 
-def _nivel_w1_por_lado(bloco, lado):
-    """Obtém o nível da W1 de Call ou Put a partir dos dados já existentes no bloco.
-
-    Não recalcula Walls e não altera o ranking do GEX. Apenas lê Principal W1 e
-    as comparações W1 já armazenadas no cache para identificar o nível do lado
-    solicitado.
-    """
-    lado = str(lado).upper().strip()
-    if lado not in {"CALL", "PUT"}:
-        return np.nan
-
-    candidatos = []
-
-    principal = bloco.get("principal")
-    if isinstance(principal, dict):
-        candidatos.append(principal)
-
-    comparacoes = bloco.get("comparacoes_principal", [])
-    if isinstance(comparacoes, list):
-        candidatos.extend(item for item in comparacoes if isinstance(item, dict))
-
-    for item in candidatos:
-        nome = str(item.get("Wall/Região GEX", "") or "").upper()
-        if "W1" not in nome or lado not in nome:
-            continue
-
-        nivel = core.numero_seguro(item.get("Nível Wall/Região"))
-        if np.isfinite(nivel):
-            return float(nivel)
-
-    return np.nan
-
-
 def _alerta_posicao_estrutura_w1(ativo_res, bloco_nome):
-    """Descreve apenas a posição atual do preço frente à W1 e às bandas extremas.
+    """Alerta a posição do preço somente contra a Principal W1 selecionada.
 
-    Regras objetivas, sem score e sem sinal de compra/venda:
-    - inferior: Preço atual abaixo da Put W1 e também abaixo de -1,5σ ou -2σ;
-    - superior: Preço atual acima da Call W1 e também acima de +1,5σ ou +2σ.
+    A Principal chega do confluence_core já obedecendo à regra direcional:
+    Put W1 × banda inferior ou Call W1 × banda superior.
 
-    O texto usa "ABAIXO"/"ACIMA", e não "ROMPEU", porque o cache contém o
-    retrato atual e não uma série intradiária que permita provar o instante do
-    cruzamento.
+    O aviso nunca procura outra W1 entre as comparações. Assim, Conf %, gráfico
+    e alerta sempre se referem à mesma estrutura Principal.
     """
     if not isinstance(ativo_res, dict):
         return ""
@@ -601,38 +566,36 @@ def _alerta_posicao_estrutura_w1(ativo_res, bloco_nome):
     if not isinstance(bloco, dict):
         return ""
 
-    preco_atual = core.numero_seguro(ativo_res.get("Preço atual"))
-    if not np.isfinite(preco_atual) or preco_atual <= 0:
+    principal = bloco.get("principal")
+    if not isinstance(principal, dict):
         return ""
 
-    bandas = bloco.get("bandas") or {}
-    menos_15 = core.numero_seguro(bandas.get("menos_15"))
-    menos_2 = core.numero_seguro(bandas.get("menos_2"))
-    mais_15 = core.numero_seguro(bandas.get("mais_15"))
-    mais_2 = core.numero_seguro(bandas.get("mais_2"))
+    preco_atual = core.numero_seguro(ativo_res.get("Preço atual"))
+    nivel_wall = core.numero_seguro(principal.get("Nível Wall/Região"))
+    nivel_banda = core.numero_seguro(principal.get("Nível banda"))
 
-    put_w1 = _nivel_w1_por_lado(bloco, "PUT")
-    call_w1 = _nivel_w1_por_lado(bloco, "CALL")
+    if not (
+        np.isfinite(preco_atual)
+        and preco_atual > 0
+        and np.isfinite(nivel_wall)
+        and np.isfinite(nivel_banda)
+    ):
+        return ""
 
-    alertas = []
+    wall = str(principal.get("Wall/Região GEX", "") or "").strip()
+    banda = str(principal.get("Banda GARCH", "") or "").strip()
 
-    # Lado inferior: exige simultaneamente estar abaixo da Put W1 e de pelo
-    # menos uma das duas bandas inferiores. Se estiver abaixo de -2σ,
-    # mostramos o nível mais extremo já ultrapassado.
-    if np.isfinite(put_w1) and preco_atual < put_w1:
-        if np.isfinite(menos_2) and preco_atual < menos_2:
-            alertas.append("🔻 ABAIXO PUT W1 E -2σ")
-        elif np.isfinite(menos_15) and preco_atual < menos_15:
-            alertas.append("🔻 ABAIXO PUT W1 E -1,5σ")
+    if wall.startswith("Put W1") and banda in {"-1,5σ", "-2σ"}:
+        if preco_atual < nivel_wall and preco_atual < nivel_banda:
+            return f"🔻 ABAIXO PUT W1 E {banda}"
+        return ""
 
-    # Lado superior: regra espelhada da inferior.
-    if np.isfinite(call_w1) and preco_atual > call_w1:
-        if np.isfinite(mais_2) and preco_atual > mais_2:
-            alertas.append("🔺 ACIMA CALL W1 E +2σ")
-        elif np.isfinite(mais_15) and preco_atual > mais_15:
-            alertas.append("🔺 ACIMA CALL W1 E +1,5σ")
+    if wall.startswith("Call W1") and banda in {"+1,5σ", "+2σ"}:
+        if preco_atual > nivel_wall and preco_atual > nivel_banda:
+            return f"🔺 ACIMA CALL W1 E {banda}"
+        return ""
 
-    return " · ".join(alertas)
+    return ""
 
 
 def _texto_confluencia_radar(conf_pct, dist_preco_pct, alerta_estrutura=""):
@@ -1569,7 +1532,9 @@ with tab3:
         "O gráfico mostra as quatro bandas GARCH do período escolhido, Principal W1, "
         "Secundária W2/W3, Preço atual, Spot GEX e Preço GARCH. "
         "O Preço atual é a referência usada para medir a distância até a zona. "
-        "A banda usada na confluência continua sendo a que ficou mais próxima da Wall/Região."
+        "Na confluência inferior, Put W1/W2/W3 compara somente com -1,5σ/-2σ; "
+        "na superior, Call W1/W2/W3 compara somente com +1,5σ/+2σ. "
+        "Dentro dessas combinações válidas, vence a menor Confluência %."
     )
 
     st.plotly_chart(
@@ -1609,7 +1574,7 @@ with tab3:
 
     if not todas.empty:
         st.markdown(
-            "#### Todas as combinações deste bloco"
+            "#### Todas as combinações direcionais válidas deste bloco"
         )
 
         cols = [
@@ -1699,7 +1664,10 @@ with tab4:
 - **Semestral GARCH × GEX 90D**.
 - **Semestral GARCH × GEX 180D**.
 - **GARCH puro Mensal/Semestral/Anual:** Banda, Distância e Status usam a leitura original do GARCH em relação ao Preço GARCH.
-- **Banda da confluência:** é a banda GARCH que ficou mais próxima da Wall/Região GEX do bloco e pode ser diferente da banda GARCH mais próxima do preço.
+- **Confluência inferior:** Put W1/W2/W3 pode ser comparada somente com as bandas inferiores -1,5σ e -2σ.
+- **Confluência superior:** Call W1/W2/W3 pode ser comparada somente com as bandas superiores +1,5σ e +2σ.
+- **Combinações cruzadas inválidas:** Call × banda inferior e Put × banda superior não participam da seleção de confluência.
+- **Banda da confluência:** dentro dos pareamentos direcionais válidos da camada, é escolhida a combinação com menor Confluência %. Ela pode ser diferente da banda GARCH mais próxima do preço.
 - **GARCH Anual:** permanece sem contraparte GEX.
 - **GEX 60D:** não participa deste painel conjunto.
 - **Confluência GARCH × GEX (%):** `|Wall/Região GEX − Banda GARCH| / Spot GEX × 100`.
@@ -1707,7 +1675,7 @@ with tab4:
 - **Spot GEX:** permanece referência interna do GEX e denominador da Confluência %.
 - **Preço GARCH:** permanece referência da leitura Banda/Distância/Status do GARCH.
 - **Distância do preço atual à zona:** usa uma cotação de mercado independente, capturada na atualização do painel. É a distância desse Preço atual até o intervalo entre Banda e Wall/Região; se o Preço atual estiver dentro do intervalo, é zero. Spot GEX e Preço GARCH não são usados como substitutos.
-- **Avisos objetivos do Radar W1:** 🎯 indica Preço atual dentro da zona; 🔻 aparece somente quando o Preço atual está abaixo da Put W1 e também abaixo de -1,5σ ou -2σ; 🔺 é a regra espelhada acima da Call W1 e de +1,5σ ou +2σ; ⭐ CONF <1% aparece quando a própria Confluência % já calculada é estritamente menor que 1%. Esses avisos não alteram cálculos, ranking, score ou sinal.
+- **Avisos objetivos do Radar W1:** 🎯 indica Preço atual dentro da zona; 🔻/🔺 usam exclusivamente a Principal W1 que gerou aquela Conf %, nunca outra W1 existente nas comparações; ⭐ CONF <1% aparece quando a própria Confluência % já calculada é estritamente menor que 1%. Esses avisos não criam score nem sinal de compra/venda.
 - Call/Put do mesmo rank só são agrupadas usando a tolerância original do GEX.
 - Participações e Gross Gamma de Call/Put compartilhadas **não são somados artificialmente**.
 - Não há score composto, nem limiar Forte/Moderada/Fraca, nem sinal de compra/venda.
