@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import gc
 import hashlib
+import html
 import io
 import os
 import pickle
@@ -759,68 +760,184 @@ def _css_confluencia_radar(conf, dist_preco):
 
 
 def dataframe_radar_w1(resultados):
-    """Renderiza a visão rápida W1 sem poluir a tela com colunas técnicas."""
+    """Renderiza o Radar W1 completo, responsivo e sem scroll horizontal.
+
+    Mantém exatamente os textos, métricas e destaques já calculados. A única
+    mudança é de apresentação: usa uma tabela HTML com largura fixa de 100%,
+    quebra automática de linha e altura variável por célula, evitando corte,
+    sobreposição de colunas e necessidade de rolagem horizontal no tablet.
+    """
     visual, metricas = tabela_radar_w1(resultados)
 
     if visual.empty:
-        st.dataframe(
-            visual,
-            use_container_width=True,
-            hide_index=True,
-        )
+        st.info("SEM DADOS no Radar W1.")
         return
 
-    estilos = pd.DataFrame(
-        "",
-        index=visual.index,
-        columns=visual.columns,
+    colunas_horizonte = (
+        "30D — Mensal",
+        "90D — Semestral",
+        "180D — Semestral",
     )
 
-    for coluna in ("30D — Mensal", "90D — Semestral", "180D — Semestral"):
-        conf = metricas[f"{coluna} · conf"]
-        dist_preco = metricas[f"{coluna} · preco"]
+    linhas_html = []
 
-        estilos[coluna] = [
-            _css_confluencia_radar(c, d)
-            for c, d in zip(conf, dist_preco)
-        ]
+    for idx, row in visual.iterrows():
+        ativo = html.escape(str(row.get("Ativo", "")))
+        preco_atual = fmt_num(row.get("Preço atual"))
 
-    styler = visual.style.apply(
-        lambda _df: estilos,
-        axis=None,
-    )
+        celulas_horizonte = []
 
-    st.dataframe(
-        styler,
-        use_container_width=True,
-        hide_index=True,
-        column_config={
-            "Ativo": st.column_config.TextColumn(
-                "Ativo",
-                width="small",
-            ),
-            "Preço atual": st.column_config.NumberColumn(
-                "Preço atual",
-                format="%.2f",
-                width="small",
-            ),
-            "30D — Mensal": st.column_config.TextColumn(
-                "30D — Mensal",
-                width="large",
-                help="GARCH Mensal × W1 do GEX 30D.",
-            ),
-            "90D — Semestral": st.column_config.TextColumn(
-                "90D — Semestral",
-                width="large",
-                help="GARCH Semestral × W1 do GEX 90D.",
-            ),
-            "180D — Semestral": st.column_config.TextColumn(
-                "180D — Semestral",
-                width="large",
-                help="GARCH Semestral × W1 do GEX 180D.",
-            ),
-        },
-        height=min(820, 38 * (len(visual) + 1)),
+        for coluna in colunas_horizonte:
+            texto = html.escape(str(row.get(coluna, "N/D")))
+            conf = metricas.loc[idx, f"{coluna} · conf"]
+            dist_preco = metricas.loc[idx, f"{coluna} · preco"]
+            estilo = _css_confluencia_radar(conf, dist_preco)
+
+            celulas_horizonte.append(
+                f'<td class="radar-v3-horizonte" style="{estilo}">{texto}</td>'
+            )
+
+        linhas_html.append(
+            "<tr>"
+            f'<td class="radar-v3-ativo">{ativo}</td>'
+            f'<td class="radar-v3-preco">{html.escape(preco_atual)}</td>'
+            + "".join(celulas_horizonte)
+            + "</tr>"
+        )
+
+    tabela_html = f"""
+    <div class="radar-v3-wrap">
+      <table class="radar-v3-table">
+        <colgroup>
+          <col class="radar-v3-col-ativo">
+          <col class="radar-v3-col-preco">
+          <col class="radar-v3-col-horizonte">
+          <col class="radar-v3-col-horizonte">
+          <col class="radar-v3-col-horizonte">
+        </colgroup>
+        <thead>
+          <tr>
+            <th>Ativo</th>
+            <th>Preço atual</th>
+            <th>30D — Mensal</th>
+            <th>90D — Semestral</th>
+            <th>180D — Semestral</th>
+          </tr>
+        </thead>
+        <tbody>
+          {''.join(linhas_html)}
+        </tbody>
+      </table>
+    </div>
+
+    <style>
+      .radar-v3-wrap {{
+        width: 100%;
+        max-width: 100%;
+        overflow: visible;
+        margin: 0;
+        padding: 0;
+      }}
+
+      .radar-v3-table {{
+        width: 100%;
+        max-width: 100%;
+        table-layout: fixed;
+        border-collapse: collapse;
+        border-spacing: 0;
+        background: #0E1117;
+        color: #F5F7FA;
+        font-size: clamp(0.72rem, 1.05vw, 0.92rem);
+        line-height: 1.32;
+      }}
+
+      .radar-v3-table th,
+      .radar-v3-table td {{
+        border: 1px solid rgba(128, 128, 128, 0.24);
+        padding: 0.54rem 0.58rem;
+        vertical-align: middle;
+        white-space: normal !important;
+        overflow: visible !important;
+        text-overflow: clip !important;
+        overflow-wrap: anywhere;
+        word-break: normal;
+        height: auto !important;
+      }}
+
+      .radar-v3-table th {{
+        background: #1B1F27;
+        color: rgba(245,247,250,0.74);
+        text-align: left;
+        font-weight: 500;
+      }}
+
+      .radar-v3-col-ativo {{
+        width: 7%;
+      }}
+
+      .radar-v3-col-preco {{
+        width: 9%;
+      }}
+
+      .radar-v3-col-horizonte {{
+        width: 28%;
+      }}
+
+      .radar-v3-ativo {{
+        font-weight: 500;
+      }}
+
+      .radar-v3-preco {{
+        text-align: right;
+        font-variant-numeric: tabular-nums;
+        white-space: nowrap !important;
+      }}
+
+      .radar-v3-horizonte {{
+        text-align: left;
+      }}
+
+      @media (max-width: 1100px) {{
+        .radar-v3-table {{
+          font-size: 0.76rem;
+          line-height: 1.28;
+        }}
+
+        .radar-v3-table th,
+        .radar-v3-table td {{
+          padding: 0.46rem 0.42rem;
+        }}
+
+        .radar-v3-col-ativo {{
+          width: 7%;
+        }}
+
+        .radar-v3-col-preco {{
+          width: 10%;
+        }}
+
+        .radar-v3-col-horizonte {{
+          width: 27.67%;
+        }}
+      }}
+
+      @media (max-width: 800px) {{
+        .radar-v3-table {{
+          font-size: 0.68rem;
+          line-height: 1.24;
+        }}
+
+        .radar-v3-table th,
+        .radar-v3-table td {{
+          padding: 0.38rem 0.34rem;
+        }}
+      }}
+    </style>
+    """
+
+    st.markdown(
+        tabela_html,
+        unsafe_allow_html=True,
     )
 
 
@@ -1294,17 +1411,6 @@ tab1, tab2, tab3, tab4 = st.tabs(
 
 with tab1:
     st.subheader("Radar W1 — visão rápida")
-
-    st.caption(
-        "Cada horizonte mantém as mesmas métricas da V3: "
-        "Conf = distância entre Banda GARCH e W1, com Spot GEX como denominador; "
-        "Dist. zona = distância do Preço atual até a zona Banda↔W1. "
-        "🎯 PREÇO DENTRO DA ZONA = preço dentro do intervalo; "
-        "🔻 = preço abaixo da Put W1 e também de -1,5σ ou -2σ; "
-        "🔺 = preço acima da Call W1 e também de +1,5σ ou +2σ; "
-        "⭐ CONF <1% = a Confluência já calculada é menor que 1%. "
-        "São avisos factuais de posição, sem score e sem sinal de compra/venda."
-    )
 
     dataframe_radar_w1(resultados)
 
