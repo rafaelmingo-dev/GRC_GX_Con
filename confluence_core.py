@@ -22,9 +22,12 @@ import gex_core as gex
 #
 # Principal   = somente W1
 # Secundária  = somente W2/W3
+# Confluência inferior = Put W1/W2/W3 × bandas inferiores (-1,5σ / -2σ)
+# Confluência superior = Call W1/W2/W3 × bandas superiores (+1,5σ / +2σ)
+# Combinações cruzadas Call×banda inferior e Put×banda superior são inválidas.
 # Sem score composto.
 # Sem limiar forte/fraca.
-# Sem interpretação direcional.
+# Sem sinal de compra/venda.
 # ======================================================================================
 
 BANDAS_COMPARADAS = [
@@ -33,6 +36,16 @@ BANDAS_COMPARADAS = [
     ("+1,5σ", "mais_15"),
     ("+2σ", "mais_2"),
 ]
+
+BANDAS_INFERIORES = (
+    ("-1,5σ", "menos_15"),
+    ("-2σ", "menos_2"),
+)
+
+BANDAS_SUPERIORES = (
+    ("+1,5σ", "mais_15"),
+    ("+2σ", "mais_2"),
+)
 
 BLOCOS_CONFLUENCIA = [
     {"bloco": "Mensal × 30D", "garch_periodo": "MENSAL", "gex_horizonte": "30 dias"},
@@ -54,6 +67,18 @@ def validar_configuracao() -> None:
         raise RuntimeError("Configuração GARCH × GEX foi alterada indevidamente.")
     if any(b["gex_horizonte"] == "60 dias" for b in BLOCOS_CONFLUENCIA):
         raise RuntimeError("GEX 60D não deve participar do cruzamento V3.")
+
+    if BANDAS_INFERIORES != (
+        ("-1,5σ", "menos_15"),
+        ("-2σ", "menos_2"),
+    ):
+        raise RuntimeError("Bandas inferiores direcionais foram alteradas indevidamente.")
+
+    if BANDAS_SUPERIORES != (
+        ("+1,5σ", "mais_15"),
+        ("+2σ", "mais_2"),
+    ):
+        raise RuntimeError("Bandas superiores direcionais foram alteradas indevidamente.")
 
 
 validar_configuracao()
@@ -222,6 +247,52 @@ def construir_regioes_gex_v3(metrics, ranks, camada):
     return regioes
 
 
+def construir_regioes_direcionais_v3(metrics, ranks, camada):
+    """Constrói uma região por Wall, mantendo Call e Put separadas.
+
+    A função original construir_regioes_gex_v3() continua intacta para
+    preservar a lógica histórica de Call/Put compartilhada. Porém a nova
+    regra de confluência é direcional, então a seleção precisa tratar cada
+    lado separadamente:
+    - Put -> bandas inferiores;
+    - Call -> bandas superiores.
+    """
+    if metrics is None:
+        return []
+
+    ranks = {int(r) for r in ranks}
+    regioes = []
+
+    for wall in lista_walls(metrics):
+        if int(wall["rank"]) not in ranks:
+            continue
+
+        regiao = construir_regiao_single_v3(wall, camada)
+        if regiao is not None:
+            regioes.append(regiao)
+
+    def chave(regiao):
+        rank = int(regiao.get("Rank Wall", 9))
+        nome = str(regiao.get("Wall/Região GEX", ""))
+        lado_ordem = 0 if nome.startswith("Put ") else 1
+        return rank, lado_ordem, nome
+
+    return sorted(regioes, key=chave)
+
+
+def bandas_direcionais_para_regiao_v3(regiao):
+    """Retorna somente as bandas permitidas para o lado da Wall."""
+    nome = str(regiao.get("Wall/Região GEX", "") or "")
+
+    if nome.startswith("Put "):
+        return BANDAS_INFERIORES
+
+    if nome.startswith("Call "):
+        return BANDAS_SUPERIORES
+
+    return ()
+
+
 def metricas_zona_v3(preco_atual, banda, nivel_gex, spot_gex):
     """Mede a posição do preço atual em relação à zona Banda GARCH ↔ Wall GEX.
 
@@ -322,10 +393,15 @@ def comparar_bandas_regioes_v3(
     camada,
     ranks,
 ):
-    """Compara bandas GARCH com regiões GEX sem alterar a métrica de confluência.
+    """Compara somente os pareamentos direcionais válidos.
 
-    A confluência estrutural continua normalizada pelo Spot GEX.
-    A distância do mercado à zona usa exclusivamente o Preço atual independente.
+    Regras:
+    - Put W1/W2/W3 compara somente com -1,5σ e -2σ;
+    - Call W1/W2/W3 compara somente com +1,5σ e +2σ;
+    - Principal continua somente W1;
+    - Secundária continua somente W2/W3;
+    - Confluência % continua |Wall-Banda| / Spot GEX × 100;
+    - Distância do mercado à zona continua usando somente o Preço atual.
     """
     if bandas is None or metrics is None:
         return [], []
@@ -339,7 +415,11 @@ def comparar_bandas_regioes_v3(
     quality_score = numero_seguro(quality.get("score"))
     quality_label = str(quality.get("label", "N/D"))
 
-    regioes = construir_regioes_gex_v3(metrics, ranks=ranks, camada=camada)
+    regioes = construir_regioes_direcionais_v3(
+        metrics,
+        ranks=ranks,
+        camada=camada,
+    )
     registros_regiao, comparacoes = [], []
 
     for regiao in regioes:
@@ -363,7 +443,9 @@ def comparar_bandas_regioes_v3(
         registros_regiao.append(base_regiao)
         nivel_gex = numero_seguro(regiao["Nível Wall/Região"])
 
-        for banda_rotulo, banda_chave in BANDAS_COMPARADAS:
+        bandas_validas = bandas_direcionais_para_regiao_v3(regiao)
+
+        for banda_rotulo, banda_chave in bandas_validas:
             banda_nivel = numero_seguro(bandas.get(banda_chave))
             if not (np.isfinite(banda_nivel) and np.isfinite(nivel_gex)):
                 continue
