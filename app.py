@@ -551,13 +551,14 @@ def tabela_garch_puro(resultados):
 
 
 def _alerta_posicao_estrutura_w1(ativo_res, bloco_nome):
-    """Alerta a posição do preço somente contra a Principal W1 selecionada.
+    """Gera alerta somente com a Principal W1 que produziu a Conf % da célula.
 
-    A Principal chega do confluence_core já obedecendo à regra direcional:
-    Put W1 × banda inferior ou Call W1 × banda superior.
+    A Principal já foi filtrada pelo confluence_core:
+    - Put W1 × banda inferior;
+    - Call W1 × banda superior.
 
-    O aviso nunca procura outra W1 entre as comparações. Assim, Conf %, gráfico
-    e alerta sempre se referem à mesma estrutura Principal.
+    Isso impede misturar, na mesma célula, uma Conf % de Call W1 com um
+    aviso calculado a partir de outra Put W1.
     """
     if not isinstance(ativo_res, dict):
         return ""
@@ -1664,10 +1665,10 @@ with tab4:
 - **Semestral GARCH × GEX 90D**.
 - **Semestral GARCH × GEX 180D**.
 - **GARCH puro Mensal/Semestral/Anual:** Banda, Distância e Status usam a leitura original do GARCH em relação ao Preço GARCH.
-- **Confluência inferior:** Put W1/W2/W3 pode ser comparada somente com as bandas inferiores -1,5σ e -2σ.
-- **Confluência superior:** Call W1/W2/W3 pode ser comparada somente com as bandas superiores +1,5σ e +2σ.
-- **Combinações cruzadas inválidas:** Call × banda inferior e Put × banda superior não participam da seleção de confluência.
-- **Banda da confluência:** dentro dos pareamentos direcionais válidos da camada, é escolhida a combinação com menor Confluência %. Ela pode ser diferente da banda GARCH mais próxima do preço.
+- **Confluência inferior:** Put W1/W2/W3 pode ser comparada somente com -1,5σ e -2σ.
+- **Confluência superior:** Call W1/W2/W3 pode ser comparada somente com +1,5σ e +2σ.
+- **Combinações cruzadas inválidas:** Call × banda inferior e Put × banda superior não participam da seleção.
+- **Banda da confluência:** dentro dos pareamentos direcionais válidos da camada, vence a menor Confluência %. Ela pode ser diferente da banda GARCH mais próxima do preço.
 - **GARCH Anual:** permanece sem contraparte GEX.
 - **GEX 60D:** não participa deste painel conjunto.
 - **Confluência GARCH × GEX (%):** `|Wall/Região GEX − Banda GARCH| / Spot GEX × 100`.
@@ -1675,8 +1676,8 @@ with tab4:
 - **Spot GEX:** permanece referência interna do GEX e denominador da Confluência %.
 - **Preço GARCH:** permanece referência da leitura Banda/Distância/Status do GARCH.
 - **Distância do preço atual à zona:** usa uma cotação de mercado independente, capturada na atualização do painel. É a distância desse Preço atual até o intervalo entre Banda e Wall/Região; se o Preço atual estiver dentro do intervalo, é zero. Spot GEX e Preço GARCH não são usados como substitutos.
-- **Avisos objetivos do Radar W1:** 🎯 indica Preço atual dentro da zona; 🔻/🔺 usam exclusivamente a Principal W1 que gerou aquela Conf %, nunca outra W1 existente nas comparações; ⭐ CONF <1% aparece quando a própria Confluência % já calculada é estritamente menor que 1%. Esses avisos não criam score nem sinal de compra/venda.
-- Call/Put do mesmo rank só são agrupadas usando a tolerância original do GEX.
+- **Avisos objetivos do Radar W1:** 🎯 indica Preço atual dentro da zona; 🔻/🔺 usam exclusivamente a Principal W1 que gerou aquela Conf %; ⭐ CONF <1% aparece quando a própria Confluência % já calculada é estritamente menor que 1%. Esses avisos não criam score nem sinal de compra/venda.
+- **Call/Put compartilhadas:** a lógica antiga de agrupamento por tolerância permanece preservada no núcleo para compatibilidade, mas a seleção direcional de confluência mantém Call e Put separadas para que cada lado seja comparado somente às bandas permitidas.
 - Participações e Gross Gamma de Call/Put compartilhadas **não são somados artificialmente**.
 - Não há score composto, nem limiar Forte/Moderada/Fraca, nem sinal de compra/venda.
 """
