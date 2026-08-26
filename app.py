@@ -687,14 +687,21 @@ def tabela_radar_w1(resultados):
 
         metricas[f"{coluna_visual} · conf"] = conf
         metricas[f"{coluna_visual} · preco"] = dist_preco
+        metricas[f"{coluna_visual} · alerta"] = alertas_estrutura
 
     return visual, metricas
 
 
-def _css_confluencia_radar(conf, dist_preco):
-    """Destaque exclusivamente visual e contínuo, sem criar faixas de classificação."""
+def _css_confluencia_radar(conf, alerta_estrutura=""):
+    """Destaque visual contínuo da Conf %, com contorno só no alerta estrutural.
+
+    O fundo verde continua dependendo exclusivamente da Confluência %, sem
+    faixas, classes ou novo score. O contorno amarelo não representa mais
+    Preço dentro da zona: ele aparece somente quando a mesma célula possui
+    aviso estrutural 🔻 ABAIXO... ou 🔺 ACIMA....
+    """
     conf = core.numero_seguro(conf)
-    dist_preco = core.numero_seguro(dist_preco)
+    alerta_estrutura = str(alerta_estrutura or "").strip()
 
     if not np.isfinite(conf):
         return "color: rgba(245,247,250,0.45);"
@@ -711,13 +718,10 @@ def _css_confluencia_radar(conf, dist_preco):
         f"{alpha:.3f}); color: #F5F7FA; font-weight: {peso};"
     )
 
-    # Contorno somente quando a métrica já existente Dist Preço→Zona é zero.
-    if np.isfinite(dist_preco) and np.isclose(
-        dist_preco,
-        0.0,
-        atol=1e-12,
-        rtol=0.0,
-    ):
+    # O amarelo destaca somente os avisos direcionais já calculados pela
+    # _alerta_posicao_estrutura_w1(). 🎯 PREÇO DENTRO DA ZONA e ⭐ CONF <1%
+    # permanecem apenas como informação textual.
+    if alerta_estrutura.startswith("🔻") or alerta_estrutura.startswith("🔺"):
         css += " box-shadow: inset 0 0 0 2px rgba(247,201,72,0.95);"
 
     return css
@@ -754,8 +758,8 @@ def dataframe_radar_w1(resultados):
         for coluna in colunas_horizonte:
             texto = html.escape(str(row.get(coluna, "N/D")))
             conf = metricas.loc[idx, f"{coluna} · conf"]
-            dist_preco = metricas.loc[idx, f"{coluna} · preco"]
-            estilo = _css_confluencia_radar(conf, dist_preco)
+            alerta_estrutura = metricas.loc[idx, f"{coluna} · alerta"]
+            estilo = _css_confluencia_radar(conf, alerta_estrutura)
 
             celulas_horizonte.append(
                 f'<td class="radar-v3-horizonte" style="{estilo}">{texto}</td>'
